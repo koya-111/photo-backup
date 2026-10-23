@@ -84,18 +84,58 @@ def test_collect(tmp):
         f.write("x")
 
     cfg = dict(pb.DEFAULT_CONFIG, intake_dir=intake,
-               backup_root=os.path.join(tmp, "backup"))
+               original_dir=os.path.join(tmp, "orig"),
+               mobile_dir=os.path.join(tmp, "mob"),
+               work_dir=os.path.join(tmp, "work"))
     found = pb.collect_intake_files(cfg)
     assert len(found) == 2, f"サブフォルダを含む列挙が不正: {found}"
 
     cfg["include_subfolders"] = False
     assert len(pb.collect_intake_files(cfg)) == 1, "サブフォルダ除外が効いていない"
+
+    # 出力先が取り込みフォルダ内にあっても、自分の出力は再処理しない
+    cfg["include_subfolders"] = True
+    cfg["original_dir"] = os.path.join(intake, "Original")
+    os.makedirs(cfg["original_dir"], exist_ok=True)
+    make_image(os.path.join(cfg["original_dir"], "already.jpg"), 9)
+    found = pb.collect_intake_files(cfg)
+    assert all("Original" not in p for p in found), f"出力先を再処理している: {found}"
     print("  collect_intake_files: OK")
+
+
+def test_config_migration(tmp):
+    """旧形式(backup_root)の config.json を新形式へ読み替えられるか。"""
+    old_script_dir = pb.SCRIPT_DIR
+    pb.SCRIPT_DIR = tmp
+    try:
+        with open(os.path.join(tmp, "config.json"), "w", encoding="utf-8") as f:
+            json.dump({"intake_dir": "D:/in", "backup_root": "D:/bak",
+                       "layout": "YYYY", "jpeg_quality": 75}, f)
+
+        cfg = pb.load_config()
+        assert cfg["original_dir"] == os.path.normpath("D:/bak/Original"), cfg["original_dir"]
+        assert cfg["mobile_dir"] == os.path.normpath("D:/bak/Mobile"), cfg["mobile_dir"]
+        assert cfg["work_dir"] == os.path.normpath("D:/bak"), cfg["work_dir"]
+        assert cfg["jpeg_quality"] == 75, "既存の設定値が引き継がれていない"
+        assert cfg["image_long_side"] == 1200, "既定値が補完されていない"
+
+        # 新形式はそのまま読める(上書き保存後に再読込)
+        pb.save_config(cfg)
+        assert "backup_root" not in json.load(
+            open(os.path.join(tmp, "config.json"), encoding="utf-8")), \
+            "旧キーが保存され続けている"
+        again = pb.load_config()
+        assert again["original_dir"] == cfg["original_dir"], "保存した保存先が戻らない"
+    finally:
+        pb.SCRIPT_DIR = old_script_dir
+    print("  load_config (旧形式互換): OK")
 
 
 def test_end_to_end(tmp):
     intake = os.path.join(tmp, "e2e_intake")
-    backup = os.path.join(tmp, "e2e_backup")
+    orig = os.path.join(tmp, "e2e_orig")
+    mob = os.path.join(tmp, "e2e_mob")
+    work = os.path.join(tmp, "e2e_work")
     make_image(os.path.join(intake, "DCIM", "Camera", "a.jpg"), 3)
     # 同じ画像の複製(重複としてスキップされる想定)
     shutil.copy2(os.path.join(intake, "DCIM", "Camera", "a.jpg"),
@@ -103,7 +143,8 @@ def test_end_to_end(tmp):
     # 別の画像(処理される想定)
     make_image(os.path.join(intake, "DCIM", "Camera", "b.jpg"), 4)
 
-    cfg = dict(pb.DEFAULT_CONFIG, intake_dir=intake, backup_root=backup,
+    cfg = dict(pb.DEFAULT_CONFIG, intake_dir=intake,
+               original_dir=orig, mobile_dir=mob, work_dir=work,
                include_subfolders=True, delete_after_process=True)
     q = queue.Queue()
     pb.run_processing(cfg, q)
@@ -120,9 +161,9 @@ def test_end_to_end(tmp):
 
     original_files = []
     mobile_files = []
-    for root, _, names in os.walk(os.path.join(backup, "Original")):
+    for root, _, names in os.walk(orig):
         original_files += [os.path.join(root, n) for n in names]
-    for root, _, names in os.walk(os.path.join(backup, "Mobile")):
+    for root, _, names in os.walk(mob):
         mobile_files += [os.path.join(root, n) for n in names]
 
     assert len(original_files) == 2, f"原本の数が不正: {original_files}"
@@ -137,15 +178,38 @@ def test_end_to_end(tmp):
     with Image.open(mobile_files[0]) as im:
         assert max(im.size) <= 1200, f"リサイズされていない: {im.size}"
 
+    # ログと重複DBは work_dir に置かれる
+    assert os.path.exists(os.path.join(work, "hashes.json")), "重複DBが work_dir に無い"
+    assert os.path.exists(os.path.join(work, "backup_log.txt")), "ログが work_dir に無い"
+    assert not os.path.exists(os.path.join(work, "Original")), "work_dir に Original が出来ている"
+
     # 既定では取り込み元が空になり、空フォルダも片付く
     remaining = [n for _, _, names in os.walk(intake) for n in names]
     assert not remaining, f"取り込み元にファイルが残っている: {remaining}"
     assert not os.path.exists(os.path.join(intake, "DCIM")), "空フォルダが残っている"
 
-    # 2 回目の実行では対象なし(重複DBが保存されている)
-    with open(os.path.join(backup, "hashes.json"), encoding="utf-8") as f:
+    with open(os.path.join(work, "hashes.json"), encoding="utf-8") as f:
         assert len(json.load(f)["hashes"]) == 2, "ハッシュDBの件数が不正"
     print("  end-to-end: OK")
+
+
+def test_compression_settings(tmp):
+    """長辺・JPEG 品質の指定が出力に反映されるか。"""
+    intake = os.path.join(tmp, "comp_intake")
+    orig = os.path.join(tmp, "comp_orig")
+    mob = os.path.join(tmp, "comp_mob")
+    make_image(os.path.join(intake, "c.jpg"), 7, size=(3000, 2000))
+
+    cfg = dict(pb.DEFAULT_CONFIG, intake_dir=intake, original_dir=orig,
+               mobile_dir=mob, work_dir=os.path.join(tmp, "comp_work"),
+               image_long_side=800, jpeg_quality=50, delete_after_process=True)
+    pb.run_processing(cfg, queue.Queue())
+
+    out = [os.path.join(r, n) for r, _, ns in os.walk(mob) for n in ns]
+    assert len(out) == 1, out
+    with Image.open(out[0]) as im:
+        assert max(im.size) == 800, f"長辺指定が反映されていない: {im.size}"
+    print("  compression settings: OK")
 
 
 def main():
@@ -157,7 +221,9 @@ def main():
         test_hash_store(tmp)
         test_datetime_from_filename()
         test_collect(tmp)
+        test_config_migration(tmp)
         test_end_to_end(tmp)
+        test_compression_settings(tmp)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
     print("すべて成功")

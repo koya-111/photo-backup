@@ -108,19 +108,29 @@ APP_NAME = "PhotoBackup"
 
 # ---------------------------------------------------------------- 設定の既定値
 DEFAULT_CONFIG = {
-    "intake_dir": r"C:\PhotoImport",       # 取り込みフォルダ
-    "backup_root": r"C:\PhotoBackup",      # バックアップ親フォルダ
-    "layout": "YYYY\\MM",                  # 整理方法: flat / YYYY / YYYY\MM / YYYY\MM\DD
-    "include_subfolders": True,            # 取り込みフォルダのサブフォルダも対象にするか
-    "delete_after_process": True,          # 処理後に取り込みフォルダから削除するか
-    "compress_video": False,               # 動画も圧縮するか
-    "phash_threshold": 5,                  # pHash ハミング距離のしきい値(これ以下で重複扱い)
-    "image_long_side": 1200,               # スマホ戻し用画像の長辺ピクセル
-    "jpeg_quality": 80,                    # JPEG 品質(1〜100)
-    "video_crf": 28,                       # 動画圧縮の CRF(小さいほど高画質・大容量)
-    "video_preset": "medium",              # libx265 のプリセット
-    "ffmpeg_path": "ffmpeg",               # ffmpeg 実行パス(PATH に入っていれば "ffmpeg")
+    "intake_dir": r"C:\PhotoImport",           # 取り込みフォルダ
+    "original_dir": r"C:\PhotoBackup\Original",  # 原本の保存先
+    "mobile_dir": r"C:\PhotoBackup\Mobile",      # スマホ戻し用の保存先
+    "work_dir": r"C:\PhotoBackup",             # ログ・重複判定DBの保存先
+    "layout": "YYYY\\MM",                      # 整理方法: flat / YYYY / YYYY\MM / YYYY\MM\DD
+    "include_subfolders": True,                # 取り込みフォルダのサブフォルダも対象にするか
+    "delete_after_process": True,              # 処理後に取り込みフォルダから削除するか
+    "compress_video": False,                   # 動画も圧縮するか
+    "phash_threshold": 5,                      # pHash ハミング距離のしきい値(これ以下で重複扱い)
+    "image_long_side": 1200,                   # スマホ戻し用画像の長辺ピクセル
+    "jpeg_quality": 80,                        # JPEG 品質(1〜100)
+    "video_crf": 28,                           # 動画圧縮の CRF(小さいほど高画質・大容量)
+    "video_preset": "medium",                  # libx265 のプリセット
+    "ffmpeg_path": "ffmpeg",                   # ffmpeg 実行パス(PATH に入っていれば "ffmpeg")
 }
+
+# 圧縮の程度のプリセット(長辺px, JPEG品質, 動画CRF)
+COMPRESSION_PRESETS = {
+    "標準（現行設定）": (1200, 80, 28),
+    "高画質（大きめ）": (1920, 90, 23),
+    "容量優先（小さめ）": (1080, 70, 32),
+}
+DEFAULT_PRESET = "標準（現行設定）"
 
 # 整理方法(キー) → GUI 表示ラベル
 LAYOUT_LABELS = {
@@ -149,6 +159,17 @@ def config_path():
     return os.path.join(SCRIPT_DIR, "config.json")
 
 
+def normalize_dir(path, fallback=""):
+    """入力されたパスを整形する(引用符・環境変数・~ を解決)。"""
+    if not path:
+        return fallback
+    p = str(path).strip().strip('"').strip("'")
+    if not p:
+        return fallback
+    p = os.path.expandvars(os.path.expanduser(p))
+    return os.path.normpath(p)
+
+
 def load_config():
     cfg = dict(DEFAULT_CONFIG)
     p = config_path()
@@ -160,34 +181,55 @@ def load_config():
                 for k in DEFAULT_CONFIG:
                     if k in data:
                         cfg[k] = data[k]
+                # 旧形式(backup_root ひとつ)からの移行
+                root = data.get("backup_root")
+                if root:
+                    if "original_dir" not in data:
+                        cfg["original_dir"] = os.path.join(root, "Original")
+                    if "mobile_dir" not in data:
+                        cfg["mobile_dir"] = os.path.join(root, "Mobile")
+                    if "work_dir" not in data:
+                        cfg["work_dir"] = root
         except Exception:
             pass
+    for key in ("intake_dir", "original_dir", "mobile_dir", "work_dir"):
+        cfg[key] = normalize_dir(cfg.get(key), DEFAULT_CONFIG[key])
     return cfg
 
 
 def save_config(cfg):
+    data = {k: cfg[k] for k in DEFAULT_CONFIG if k in cfg}
     try:
         with open(config_path(), "w", encoding="utf-8") as f:
-            json.dump(cfg, f, ensure_ascii=False, indent=2)
+            json.dump(data, f, ensure_ascii=False, indent=2)
     except Exception:
         pass
 
 
 # ---------------------------------------------------------------- パス派生
 def original_dir(cfg):
-    return os.path.join(cfg["backup_root"], "Original")
+    return cfg.get("original_dir") or os.path.join(DEFAULT_CONFIG["work_dir"], "Original")
 
 
 def mobile_dir(cfg):
-    return os.path.join(cfg["backup_root"], "Mobile")
+    return cfg.get("mobile_dir") or os.path.join(DEFAULT_CONFIG["work_dir"], "Mobile")
+
+
+def work_dir(cfg):
+    return cfg.get("work_dir") or DEFAULT_CONFIG["work_dir"]
 
 
 def log_path(cfg):
-    return os.path.join(cfg["backup_root"], "backup_log.txt")
+    return os.path.join(work_dir(cfg), "backup_log.txt")
 
 
 def hash_db_path(cfg):
-    return os.path.join(cfg["backup_root"], "hashes.json")
+    return os.path.join(work_dir(cfg), "hashes.json")
+
+
+def output_dirs(cfg):
+    """出力・管理用フォルダの一覧(取り込み元の除外判定に使う)。"""
+    return [original_dir(cfg), mobile_dir(cfg), work_dir(cfg)]
 
 
 def layout_subfolder(dt, layout):
@@ -527,13 +569,13 @@ def collect_intake_files(cfg, log=None):
     """取り込みフォルダから処理対象ファイルを列挙する。
 
     include_subfolders が True ならサブフォルダも再帰的に走査する。
-    バックアップ先(backup_root)が取り込みフォルダの中にある場合は、
+    出力先(Original / Mobile / ログ・DB)が取り込みフォルダの中にある場合は、
     自分が出力したファイルを再処理しないよう除外する。
     """
     intake = os.path.abspath(cfg["intake_dir"])
-    backup_root = os.path.abspath(cfg["backup_root"])
-    backup_inside_intake = backup_root != intake and backup_root.startswith(
-        intake + os.sep)
+    excluded = [os.path.abspath(d) for d in output_dirs(cfg) if d]
+    nested = [d for d in excluded
+              if d != intake and d.startswith(intake + os.sep)]
 
     def is_candidate(path):
         ext = os.path.splitext(path)[1].lower()
@@ -541,32 +583,31 @@ def collect_intake_files(cfg, log=None):
             return True
         return bool(cfg["compress_video"] and ext in VIDEO_EXTS)
 
-    def in_backup_tree(path):
-        if not backup_inside_intake:
-            return False
+    def is_excluded(path):
         p = os.path.abspath(path)
-        return p == backup_root or p.startswith(backup_root + os.sep)
+        return any(p == d or p.startswith(d + os.sep) for d in excluded)
 
     paths = []
     if cfg.get("include_subfolders", True):
         for root, dirs, names in os.walk(intake):
-            if in_backup_tree(root):
+            if is_excluded(root):
                 dirs[:] = []
                 continue
             dirs.sort()
             for name in sorted(names):
                 p = os.path.join(root, name)
-                if os.path.isfile(p) and is_candidate(p):
+                if os.path.isfile(p) and is_candidate(p) and not is_excluded(p):
                     paths.append(p)
     else:
         for name in sorted(os.listdir(intake)):
             p = os.path.join(intake, name)
-            if os.path.isfile(p) and is_candidate(p):
+            if os.path.isfile(p) and is_candidate(p) and not is_excluded(p):
                 paths.append(p)
 
-    if backup_inside_intake and log:
-        log("WARN", "バックアップ先が取り込みフォルダ内にあります。"
-                    "出力済みファイルは処理対象から除外します。")
+    if nested and log:
+        log("WARN", "出力先が取り込みフォルダ内にあります: "
+                    + ", ".join(nested)
+                    + "（出力済みファイルは処理対象から除外します）")
     return paths
 
 
@@ -592,7 +633,7 @@ def run_processing(cfg, q):
     def log(level, msg):
         emit_log(q, log_file, level, msg)
 
-    for d in (original_dir(cfg), mobile_dir(cfg)):
+    for d in (original_dir(cfg), mobile_dir(cfg), work_dir(cfg)):
         try:
             os.makedirs(d, exist_ok=True)
         except Exception as e:
@@ -697,56 +738,118 @@ class App(tk.Tk):
                              "「pip install pillow-heif」を実行してください。")
     # --- UI 構築 ---
     def _build_ui(self):
-        pad = {"padx": 8, "pady": 4}
+        pad = {"padx": 10, "pady": 4}
+        self.minsize(780, 640)
+        self.columnconfigure(0, weight=1)
+        self.rowconfigure(6, weight=1)
 
-        f1 = ttk.Frame(self)
-        f1.pack(fill="x", **pad)
-        ttk.Label(f1, text="取り込みフォルダ:").pack(side="left")
+        # 取り込みフォルダ
+        f_intake = ttk.Frame(self)
+        f_intake.grid(row=0, column=0, sticky="ew", **pad)
+        f_intake.columnconfigure(1, weight=1)
+        ttk.Label(f_intake, text="取り込みフォルダ:").grid(row=0, column=0, sticky="w")
         self.intake_var = tk.StringVar()
-        ttk.Entry(f1, textvariable=self.intake_var).pack(
-            side="left", fill="x", expand=True, padx=6)
-        ttk.Button(f1, text="参照...", command=self._browse).pack(side="left")
+        ttk.Entry(f_intake, textvariable=self.intake_var).grid(
+            row=0, column=1, sticky="ew", padx=6)
+        ttk.Button(f_intake, text="参照...", width=8,
+                   command=lambda: self._browse(self.intake_var,
+                                                "取り込みフォルダを選択")).grid(row=0, column=2)
 
-        f2 = ttk.LabelFrame(self, text="設定")
-        f2.pack(fill="x", **pad)
+        # 保存先(Original / Mobile / ログ・DB を個別指定)
+        f_dest = ttk.LabelFrame(self, text="保存先")
+        f_dest.grid(row=1, column=0, sticky="ew", **pad)
+        f_dest.columnconfigure(1, weight=1)
+        self.original_var = tk.StringVar()
+        self.mobile_var = tk.StringVar()
+        self.work_var = tk.StringVar()
+        for i, (label, var, title) in enumerate((
+            ("Original（原本）:", self.original_var, "Original の保存先を選択"),
+            ("Mobile（スマホ戻し用）:", self.mobile_var, "Mobile の保存先を選択"),
+            ("ログ・重複DB:", self.work_var, "ログと重複判定DBの保存先を選択"),
+        )):
+            ttk.Label(f_dest, text=label).grid(
+                row=i, column=0, sticky="w", padx=6, pady=2)
+            ttk.Entry(f_dest, textvariable=var).grid(
+                row=i, column=1, sticky="ew", padx=6, pady=2)
+            ttk.Button(f_dest, text="参照...", width=8,
+                       command=lambda v=var, t=title: self._browse(v, t)).grid(
+                row=i, column=2, padx=(0, 6), pady=2)
 
-        row = ttk.Frame(f2)
-        row.pack(fill="x", pady=2)
-        ttk.Label(row, text="整理方法:").pack(side="left")
+        # 整理・動作
+        f_set = ttk.LabelFrame(self, text="整理と動作")
+        f_set.grid(row=2, column=0, sticky="ew", **pad)
+        f_set.columnconfigure(1, weight=1)
+        ttk.Label(f_set, text="整理方法:").grid(row=0, column=0, sticky="w", padx=6)
         self.layout_combo = ttk.Combobox(
-            row, state="readonly", width=26, values=list(LAYOUT_LABELS.values()))
-        self.layout_combo.pack(side="left", padx=6)
+            f_set, state="readonly", width=24, values=list(LAYOUT_LABELS.values()))
+        self.layout_combo.grid(row=0, column=1, sticky="w", padx=6, pady=2)
+
+        ttk.Label(f_set, text="pHash しきい値(小さいほど厳密):").grid(
+            row=1, column=0, sticky="w", padx=6)
+        self.threshold_var = tk.StringVar(value="5")
+        ttk.Spinbox(f_set, from_=0, to=20, width=5,
+                    textvariable=self.threshold_var).grid(
+            row=1, column=1, sticky="w", padx=6, pady=2)
 
         self.delete_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(f2, text="処理後に取り込みフォルダから削除する",
-                        variable=self.delete_var).pack(anchor="w")
         self.subdir_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(f2, text="サブフォルダも対象にする(DCIM\\Camera などの階層に対応)",
-                        variable=self.subdir_var).pack(anchor="w")
         self.video_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(f2, text="動画も圧縮する(要 FFmpeg)",
-                        variable=self.video_var).pack(anchor="w")
+        ttk.Checkbutton(f_set, text="処理後に取り込みフォルダから削除する",
+                        variable=self.delete_var).grid(
+            row=2, column=0, columnspan=2, sticky="w", padx=6)
+        ttk.Checkbutton(f_set, text="サブフォルダも対象にする(DCIM\\Camera などの階層に対応)",
+                        variable=self.subdir_var).grid(
+            row=3, column=0, columnspan=2, sticky="w", padx=6)
+        ttk.Checkbutton(f_set, text="動画も圧縮する(要 FFmpeg)",
+                        variable=self.video_var).grid(
+            row=4, column=0, columnspan=2, sticky="w", padx=6)
 
-        row2 = ttk.Frame(f2)
-        row2.pack(fill="x", pady=2)
-        ttk.Label(row2, text="pHash しきい値(小さいほど厳密):").pack(side="left")
-        self.threshold_var = tk.StringVar(value="5")
-        ttk.Spinbox(row2, from_=0, to=20, width=5,
-                    textvariable=self.threshold_var).pack(side="left", padx=6)
+        # 圧縮の程度
+        f_comp = ttk.LabelFrame(self, text="圧縮の程度")
+        f_comp.grid(row=3, column=0, sticky="ew", **pad)
+        f_comp.columnconfigure(3, weight=1)
 
-        f3 = ttk.Frame(self)
-        f3.pack(fill="x", **pad)
-        self.run_btn = ttk.Button(f3, text="実行", command=self._start)
+        ttk.Label(f_comp, text="プリセット:").grid(row=0, column=0, sticky="w", padx=6)
+        self.preset_combo = ttk.Combobox(
+            f_comp, state="readonly", width=18,
+            values=list(COMPRESSION_PRESETS) + ["カスタム"])
+        self.preset_combo.grid(row=0, column=1, sticky="w", padx=6, pady=2)
+        self.preset_combo.bind("<<ComboboxSelected>>", self._apply_preset)
+
+        f_num = ttk.Frame(f_comp)
+        f_num.grid(row=1, column=0, columnspan=4, sticky="ew", padx=6, pady=2)
+        self.long_side_var = tk.StringVar(value="1200")
+        self.quality_var = tk.StringVar(value="80")
+        self.crf_var = tk.StringVar(value="28")
+        ttk.Label(f_num, text="画像の長辺:").pack(side="left")
+        ttk.Spinbox(f_num, from_=320, to=6000, increment=40, width=7,
+                    textvariable=self.long_side_var).pack(side="left", padx=(4, 12))
+        ttk.Label(f_num, text="px　JPEG 品質:").pack(side="left")
+        ttk.Spinbox(f_num, from_=30, to=100, increment=5, width=5,
+                    textvariable=self.quality_var).pack(side="left", padx=(4, 12))
+        ttk.Label(f_num, text="動画 CRF:").pack(side="left")
+        ttk.Spinbox(f_num, from_=0, to=51, increment=1, width=5,
+                    textvariable=self.crf_var).pack(side="left", padx=4)
+
+        ttk.Label(f_comp, foreground="#555",
+                  text="長辺を小さく・品質を下げる・CRF を上げるほど容量が減ります"
+                       "（動画 CRF は 18〜32 が目安）。").grid(
+            row=2, column=0, columnspan=4, sticky="w", padx=6, pady=(0, 4))
+
+        # 実行
+        f_run = ttk.Frame(self)
+        f_run.grid(row=4, column=0, sticky="ew", **pad)
+        self.run_btn = ttk.Button(f_run, text="実行", command=self._start)
         self.run_btn.pack(side="left")
-        self.progress = ttk.Progressbar(f3, mode="determinate")
+        self.progress = ttk.Progressbar(f_run, mode="determinate")
         self.progress.pack(side="left", fill="x", expand=True, padx=8)
 
         self.result_var = tk.StringVar(value="フォルダを確認して「実行」を押してください。")
-        ttk.Label(self, textvariable=self.result_var, wraplength=560,
-                  justify="left").pack(fill="x", **pad)
+        ttk.Label(self, textvariable=self.result_var, wraplength=760,
+                  justify="left").grid(row=5, column=0, sticky="ew", **pad)
 
-        self.log_text = scrolledtext.ScrolledText(self, height=12, state="disabled")
-        self.log_text.pack(fill="both", expand=True, **pad)
+        self.log_text = scrolledtext.ScrolledText(self, height=10, state="disabled")
+        self.log_text.grid(row=6, column=0, sticky="nsew", **pad)
 
     # --- UI ヘルパ ---
     def _append_log(self, text):
@@ -755,11 +858,22 @@ class App(tk.Tk):
         self.log_text.see("end")
         self.log_text.config(state="disabled")
 
-    def _browse(self):
-        d = filedialog.askdirectory(initialdir=self.intake_var.get() or None,
-                                    title="取り込みフォルダを選択")
+    def _browse(self, var, title):
+        initial = var.get() or None
+        if initial and not os.path.isdir(initial):
+            initial = os.path.dirname(initial) or None
+        d = filedialog.askdirectory(initialdir=initial, title=title)
         if d:
-            self.intake_var.set(d)
+            var.set(os.path.normpath(d))
+
+    def _apply_preset(self, _event=None):
+        values = COMPRESSION_PRESETS.get(self.preset_combo.get())
+        if not values:
+            return  # カスタムは現在値を維持
+        long_side, quality, crf = values
+        self.long_side_var.set(str(long_side))
+        self.quality_var.set(str(quality))
+        self.crf_var.set(str(crf))
 
     @staticmethod
     def _layout_key_from_label(label):
@@ -772,35 +886,85 @@ class App(tk.Tk):
     def _layout_label_from_key(key):
         return LAYOUT_LABELS.get(key, LAYOUT_LABELS["YYYY\\MM"])
 
+    @staticmethod
+    def _int_or(value, default, low, high):
+        try:
+            n = int(float(value))
+        except Exception:
+            return default
+        return max(low, min(high, n))
+
     def _load_cfg_to_ui(self):
         self.intake_var.set(self.cfg["intake_dir"])
+        self.original_var.set(self.cfg["original_dir"])
+        self.mobile_var.set(self.cfg["mobile_dir"])
+        self.work_var.set(self.cfg["work_dir"])
         self.layout_combo.set(self._layout_label_from_key(self.cfg["layout"]))
         self.delete_var.set(bool(self.cfg["delete_after_process"]))
         self.subdir_var.set(bool(self.cfg.get("include_subfolders", True)))
         self.video_var.set(bool(self.cfg["compress_video"]))
         self.threshold_var.set(str(self.cfg["phash_threshold"]))
+        self.long_side_var.set(str(self.cfg["image_long_side"]))
+        self.quality_var.set(str(self.cfg["jpeg_quality"]))
+        self.crf_var.set(str(self.cfg["video_crf"]))
+
+        current = (self.cfg["image_long_side"], self.cfg["jpeg_quality"],
+                   self.cfg["video_crf"])
+        preset = next((n for n, v in COMPRESSION_PRESETS.items() if v == current), "カスタム")
+        self.preset_combo.set(preset)
 
     def _save_ui_to_cfg(self):
-        self.cfg["intake_dir"] = self.intake_var.get().strip() or DEFAULT_CONFIG["intake_dir"]
+        self.cfg["intake_dir"] = normalize_dir(
+            self.intake_var.get(), DEFAULT_CONFIG["intake_dir"])
+        self.cfg["original_dir"] = normalize_dir(
+            self.original_var.get(), DEFAULT_CONFIG["original_dir"])
+        self.cfg["mobile_dir"] = normalize_dir(
+            self.mobile_var.get(), DEFAULT_CONFIG["mobile_dir"])
+        self.cfg["work_dir"] = normalize_dir(
+            self.work_var.get(), DEFAULT_CONFIG["work_dir"])
         self.cfg["layout"] = self._layout_key_from_label(self.layout_combo.get())
         self.cfg["delete_after_process"] = bool(self.delete_var.get())
         self.cfg["include_subfolders"] = bool(self.subdir_var.get())
         self.cfg["compress_video"] = bool(self.video_var.get())
-        try:
-            self.cfg["phash_threshold"] = int(float(self.threshold_var.get()))
-        except Exception:
-            self.cfg["phash_threshold"] = DEFAULT_CONFIG["phash_threshold"]
+        self.cfg["phash_threshold"] = self._int_or(
+            self.threshold_var.get(), DEFAULT_CONFIG["phash_threshold"], 0, 20)
+        self.cfg["image_long_side"] = self._int_or(
+            self.long_side_var.get(), DEFAULT_CONFIG["image_long_side"], 320, 6000)
+        self.cfg["jpeg_quality"] = self._int_or(
+            self.quality_var.get(), DEFAULT_CONFIG["jpeg_quality"], 30, 100)
+        self.cfg["video_crf"] = self._int_or(
+            self.crf_var.get(), DEFAULT_CONFIG["video_crf"], 0, 51)
 
     # --- 実行 ---
+    def _validate_paths(self):
+        """保存先の組み合わせを検証し、問題があればメッセージを返す。"""
+        intake = os.path.abspath(self.cfg["intake_dir"])
+        orig = os.path.abspath(self.cfg["original_dir"])
+        mob = os.path.abspath(self.cfg["mobile_dir"])
+        work = os.path.abspath(self.cfg["work_dir"])
+
+        if not os.path.isdir(intake):
+            return f"取り込みフォルダが見つかりません:\n{self.cfg['intake_dir']}"
+        if orig == mob:
+            return "Original と Mobile に同じフォルダは指定できません。"
+        if orig == intake or mob == intake or work == intake:
+            return "取り込みフォルダと同じ場所は保存先に指定できません。"
+        for name, path in (("Original", orig), ("Mobile", mob)):
+            other = mob if name == "Original" else orig
+            if path.startswith(other + os.sep) or other.startswith(path + os.sep):
+                return (f"{name} ともう一方の保存先が入れ子になっています。\n"
+                        "別のフォルダを指定してください。")
+        return None
+
     def _start(self):
         if self.running:
             return
         self._save_ui_to_cfg()
         save_config(self.cfg)
 
-        if not os.path.isdir(self.cfg["intake_dir"]):
-            messagebox.showerror(
-                "エラー", f"取り込みフォルダが見つかりません:\n{self.cfg['intake_dir']}")
+        error = self._validate_paths()
+        if error:
+            messagebox.showerror("設定を確認してください", error)
             return
 
         self.running = True
