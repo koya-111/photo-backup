@@ -33,7 +33,7 @@ import subprocess
 import threading
 import time
 import tkinter as tk
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from tkinter import filedialog, messagebox, scrolledtext, simpledialog, ttk
 
 # ---------------------------------------------------------------- 依存ライブラリ
@@ -123,6 +123,7 @@ DEFAULT_CONFIG = {
     "mobile_dir": r"C:\PhotoBackup\Mobile",      # スマホ戻し用の保存先
     "work_dir": r"C:\PhotoBackup",             # ログ・重複判定DBの保存先
     "layout": "YYYY\\MM",                      # 整理方法: flat / YYYY / YYYY\MM / YYYY\MM\DD
+    "datetime_mode": "exif_local",             # 撮影日時: exif_local / exif_utc_to_local
     "include_subfolders": True,                # 取り込みフォルダのサブフォルダも対象にするか
     "delete_after_process": False,             # 処理後に取り込みフォルダから削除するか(既定は残す)
     "delete_duplicates": False,                # (旧設定) 重複スキップしたファイルも削除するか
@@ -697,12 +698,43 @@ class DuplicateChecker:
 
 
 # ---------------------------------------------------------------- 撮影日時の取得
-def get_photo_datetime(im, src):
+DATETIME_MODES = {
+    "exif_local": "EXIF の現地時刻",
+    "exif_utc_to_local": "端末のタイムゾーンに変換",
+}
+
+# EXIF のタイムゾーン表記("+09:00" など)
+_OFFSET_RE = re.compile(r"([+-])(\d{2}):?(\d{2})")
+
+
+def parse_exif_offset(value):
+    """EXIF の OffsetTime("+09:00") を timezone に変換する。"""
+    m = _OFFSET_RE.fullmatch(str(value).strip())
+    if not m:
+        return None
+    sign = 1 if m.group(1) == "+" else -1
+    return timezone(sign * timedelta(hours=int(m.group(2)),
+                                     minutes=int(m.group(3))))
+
+
+def get_photo_datetime(im, src, mode="exif_local"):
+    """撮影日時を返す。
+
+    mode:
+        "exif_local"        … EXIF の現地時刻をそのまま使う(従来の動作)
+        "exif_utc_to_local" … EXIF のタイムゾーンで UTC に直し、PC の時刻に変換
+    """
     try:
         exif = im.getexif()
         s = exif.get(0x9003) or exif.get(0x0132)  # DateTimeOriginal / DateTime
         if s:
-            return datetime.strptime(str(s).strip(), "%Y:%m:%d %H:%M:%S")
+            dt = datetime.strptime(str(s).strip(), "%Y:%m:%d %H:%M:%S")
+            if mode == "exif_utc_to_local":
+                offset = exif.get(0x9011) or exif.get(0x9010)  # OffsetTimeOriginal / OffsetTime
+                tz = parse_exif_offset(offset) if offset else None
+                if tz is not None:
+                    dt = dt.replace(tzinfo=tz).astimezone().replace(tzinfo=None)
+            return dt
     except Exception:
         pass
     return datetime.fromtimestamp(os.path.getmtime(src))
@@ -718,7 +750,7 @@ def prepare_image(src, cfg):
         im.load()
         exif = im.getexif()
         icc = im.info.get("icc_profile")
-        dt = get_photo_datetime(im, src)
+        dt = get_photo_datetime(im, src, cfg.get("datetime_mode", "exif_local"))
 
         # 向き(Orientation)を適用して、以後は正立画像として扱う
         try:
@@ -1434,9 +1466,20 @@ class App(tk.Tk):
             f_set, state="readonly", width=24, values=list(LAYOUT_LABELS.values()))
         self.layout_combo.grid(row=0, column=1, sticky="w", padx=6, pady=2)
 
+        # 撮影日時の扱い(タイムゾーン)
+        f_dt = ttk.Frame(f_set)
+        f_dt.grid(row=1, column=0, columnspan=2, sticky="w", padx=6, pady=2)
+        ttk.Label(f_dt, text="撮影日時:").pack(side="left")
+        self.datetime_combo = ttk.Combobox(
+            f_dt, state="readonly", width=24, values=list(DATETIME_MODES.values()))
+        self.datetime_combo.pack(side="left", padx=4)
+        ttk.Label(f_dt, foreground="#555",
+                  text="（海外で撮った写真を日本時間に直す場合は「端末のタイムゾーンに変換」）").pack(
+            side="left")
+
         # 重複スキップ(オン/オフ + 判定方法 + pHash しきい値)
         f_dedup = ttk.Frame(f_set)
-        f_dedup.grid(row=1, column=0, columnspan=2, sticky="w", padx=6, pady=2)
+        f_dedup.grid(row=2, column=0, columnspan=2, sticky="w", padx=6, pady=2)
         self.dedup_var = tk.BooleanVar(value=False)
         self.dedup_check = ttk.Checkbutton(
             f_dedup, text="重複スキップを有効にする", variable=self.dedup_var,
@@ -1455,7 +1498,7 @@ class App(tk.Tk):
 
         # 重複と判定したファイルの扱い
         f_dupact = ttk.Frame(f_set)
-        f_dupact.grid(row=2, column=0, columnspan=2, sticky="w", padx=6, pady=2)
+        f_dupact.grid(row=3, column=0, columnspan=2, sticky="w", padx=6, pady=2)
         ttk.Label(f_dupact, text="　重複時の扱い:").pack(side="left")
         self.dup_action_combo = ttk.Combobox(
             f_dupact, state="readonly", width=18,
@@ -1467,17 +1510,17 @@ class App(tk.Tk):
         self.video_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(f_set, text="処理後に取り込みフォルダから削除する",
                         variable=self.delete_var).grid(
-            row=3, column=0, columnspan=2, sticky="w", padx=6)
+            row=4, column=0, columnspan=2, sticky="w", padx=6)
         ttk.Checkbutton(f_set, text="サブフォルダも対象にする(DCIM\\Camera などの階層に対応)",
                         variable=self.subdir_var).grid(
-            row=4, column=0, columnspan=2, sticky="w", padx=6)
+            row=5, column=0, columnspan=2, sticky="w", padx=6)
         ttk.Checkbutton(f_set, text="動画も圧縮する(要 FFmpeg)",
                         variable=self.video_var).grid(
-            row=5, column=0, columnspan=2, sticky="w", padx=6)
+            row=6, column=0, columnspan=2, sticky="w", padx=6)
 
         # フォルダ監視
         f_watch = ttk.Frame(f_set)
-        f_watch.grid(row=6, column=0, columnspan=2, sticky="w", padx=6, pady=(2, 4))
+        f_watch.grid(row=7, column=0, columnspan=2, sticky="w", padx=6, pady=(2, 4))
         self.watch_var = tk.BooleanVar(value=False)
         self.watch_check = ttk.Checkbutton(
             f_watch, text="取り込みフォルダを監視して自動実行",
@@ -1729,6 +1772,13 @@ class App(tk.Tk):
                 return key
         return "keep"
 
+    def _datetime_mode_key(self):
+        label = self.datetime_combo.get()
+        for key, text in DATETIME_MODES.items():
+            if text == label:
+                return key
+        return "exif_local"
+
     def _apply_preset(self, _event=None):
         values = COMPRESSION_PRESETS.get(self.preset_combo.get())
         if not values:
@@ -1763,6 +1813,8 @@ class App(tk.Tk):
         self.mobile_var.set(self.cfg["mobile_dir"])
         self.work_var.set(self.cfg["work_dir"])
         self.layout_combo.set(self._layout_label_from_key(self.cfg["layout"]))
+        mode = self.cfg.get("datetime_mode", "exif_local")
+        self.datetime_combo.set(DATETIME_MODES.get(mode, DATETIME_MODES["exif_local"]))
         self.delete_var.set(bool(self.cfg["delete_after_process"]))
         self.subdir_var.set(bool(self.cfg.get("include_subfolders", True)))
         self.video_var.set(bool(self.cfg["compress_video"]))
@@ -1800,6 +1852,7 @@ class App(tk.Tk):
         self.cfg["work_dir"] = normalize_dir(
             self.work_var.get(), DEFAULT_CONFIG["work_dir"])
         self.cfg["layout"] = self._layout_key_from_label(self.layout_combo.get())
+        self.cfg["datetime_mode"] = self._datetime_mode_key()
         self.cfg["delete_after_process"] = bool(self.delete_var.get())
         self.cfg["include_subfolders"] = bool(self.subdir_var.get())
         self.cfg["compress_video"] = bool(self.video_var.get())

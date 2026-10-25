@@ -305,6 +305,37 @@ def test_quality(tmp):
     print("  quality: OK")
 
 
+def test_timezone(tmp):
+    """D4 撮影日時のタイムゾーン変換。"""
+    src = os.path.join(tmp, "tz.jpg")
+    os.makedirs(tmp, exist_ok=True)
+    img = Image.new("RGB", (640, 480), (100, 120, 140))
+    exif = Image.Exif()
+    exif[0x9003] = "2020:01:01 00:00:00"
+    exif[0x9011] = "+00:00"
+    img.save(src, "JPEG", exif=exif.tobytes())
+
+    with Image.open(src) as im:
+        local = pb.get_photo_datetime(im, src, "exif_local")
+        converted = pb.get_photo_datetime(im, src, "exif_utc_to_local")
+
+    assert local == datetime(2020, 1, 1, 0, 0, 0), local
+    expected = (datetime(2020, 1, 1, 0, 0, 0, tzinfo=pb.timezone.utc)
+                .astimezone().replace(tzinfo=None))
+    assert converted == expected, (converted, expected)
+
+    # タイムゾーン表記が無い場合は変換しない
+    with Image.open(src) as im:
+        im.getexif().pop(0x9011, None)
+        assert pb.get_photo_datetime(im, src, "exif_utc_to_local") == local, "変換された"
+
+    # +09:00 の解析
+    assert pb.parse_exif_offset("+09:00") == pb.timezone(pb.timedelta(hours=9))
+    assert pb.parse_exif_offset("-0530") == pb.timezone(-pb.timedelta(hours=5, minutes=30))
+    assert pb.parse_exif_offset("bad") is None
+    print("  timezone: OK")
+
+
 def test_cancel(tmp):
     """中止要求を出すと、残りのファイルを処理せずに止まる。"""
     import threading
@@ -521,6 +552,7 @@ def main():
         test_safety(tmp)
         test_ops(tmp)
         test_quality(tmp)
+        test_timezone(tmp)
         test_cancel(tmp)
         test_dedup_switch(tmp)
         test_name_dedup(tmp)
