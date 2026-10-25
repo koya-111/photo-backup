@@ -220,6 +220,45 @@ def test_delete_defaults(tmp):
     print("  delete defaults: OK")
 
 
+def test_safety(tmp):
+    """A1 コピー検証 / A2 削除 / A3 重複の退避 / A4 空き容量。"""
+    src = os.path.join(tmp, "safety_src")
+    os.makedirs(src, exist_ok=True)
+    make_image(os.path.join(src, "s.jpg"), 51)
+
+    # A1: .part を残さずコピーできる
+    dest = os.path.join(tmp, "safety_dest.jpg")
+    pb.copy_verified(os.path.join(src, "s.jpg"), dest)
+    assert os.path.exists(dest), "コピーされていない"
+    assert not os.path.exists(dest + ".part"), ".part が残っている"
+    assert os.path.getsize(dest) == os.path.getsize(os.path.join(src, "s.jpg"))
+
+    # A2: 削除(ゴミ箱が無い環境では通常削除にフォールバック)
+    assert pb.delete_file(dest, use_recycle_bin=True) in ("trash", "deleted")
+    assert not os.path.exists(dest), "削除されていない"
+
+    # A4: 空き容量が取得できる
+    assert (pb.free_space_gb(tmp) or 0) > 0, "空き容量を取得できない"
+
+    # A3: 重複を Duplicates へ退避する
+    intake = os.path.join(tmp, "safety_intake")
+    make_image(os.path.join(intake, "dup.jpg"), 52)
+    shutil.copy2(os.path.join(intake, "dup.jpg"),
+                 os.path.join(intake, "dup_copy.jpg"))
+    work = os.path.join(tmp, "safety_work")
+    cfg = dict(pb.DEFAULT_CONFIG, intake_dir=intake,
+               original_dir=os.path.join(tmp, "safety_orig"),
+               mobile_dir=os.path.join(tmp, "safety_mob"),
+               work_dir=work, enable_dedup=True, phash_threshold=0,
+               duplicate_action="move")
+    pb.run_processing(cfg, queue.Queue())
+    left = sorted(os.listdir(intake))
+    assert left == ["dup.jpg"], f"元ファイルが消えた: {left}"
+    moved = os.listdir(os.path.join(work, "Duplicates"))
+    assert moved == ["dup_copy.jpg"], f"Duplicates の中身が不正: {moved}"
+    print("  safety: OK")
+
+
 def test_cancel(tmp):
     """中止要求を出すと、残りのファイルを処理せずに止まる。"""
     import threading
@@ -374,6 +413,7 @@ def main():
         test_end_to_end(tmp)
         test_compression_settings(tmp)
         test_delete_defaults(tmp)
+        test_safety(tmp)
         test_cancel(tmp)
         test_dedup_switch(tmp)
         test_name_dedup(tmp)

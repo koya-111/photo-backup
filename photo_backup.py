@@ -68,6 +68,14 @@ except Exception:
     np = None
     NUMPY_AVAILABLE = False
 
+try:
+    from send2trash import send2trash
+
+    SEND2TRASH_AVAILABLE = True
+except Exception:
+    send2trash = None
+    SEND2TRASH_AVAILABLE = False
+
 if PILLOW_AVAILABLE:
     # 破損気味の画像でも読み込めるよう許容(途中欠損でも処理を継続する)
     ImageFile.LOAD_TRUNCATED_IMAGES = True
@@ -115,7 +123,9 @@ DEFAULT_CONFIG = {
     "layout": "YYYY\\MM",                      # 整理方法: flat / YYYY / YYYY\MM / YYYY\MM\DD
     "include_subfolders": True,                # 取り込みフォルダのサブフォルダも対象にするか
     "delete_after_process": False,             # 処理後に取り込みフォルダから削除するか(既定は残す)
-    "delete_duplicates": False,                # 重複スキップしたファイルも取り込みから削除するか
+    "delete_duplicates": False,                # (旧設定) 重複スキップしたファイルも削除するか
+    "duplicate_action": "keep",                # 重複時の扱い: keep / move / delete
+    "use_recycle_bin": True,                   # 削除はゴミ箱へ移動する(可能な場合)
     "compress_video": False,                   # 動画も圧縮するか
     "enable_dedup": False,                     # 重複スキップを行うか(既定はオフ)
     "dedup_mode": "phash",                     # 判定方法: phash / name / both
@@ -249,6 +259,129 @@ def unique_path(directory, filename):
         p = os.path.join(directory, f"{base}_{i}{ext}")
         i += 1
     return p
+
+
+# ---------------------------------------------------------------- 安全なファイル操作
+def copy_verified(src, dest):
+    """サイズ検証つきのコピー。
+
+    .part へ書いてサイズを確認してから確定させるため、容量不足などで
+    書き込みが途中で切れても壊れたファイルが残らず、成功と誤認しない。
+    """
+    tmp = dest + ".part"
+    try:
+        shutil.copy2(src, tmp)
+        expected = os.path.getsize(src)
+        actual = os.path.getsize(tmp)
+        if actual != expected:
+            raise IOError(
+                f"コピー後のサイズが一致しません（{actual} / {expected} バイト）")
+        os.replace(tmp, dest)
+        return dest
+    finally:
+        if os.path.exists(tmp):
+            _remove_quietly(tmp)
+
+
+def delete_file(path, use_recycle_bin=True):
+    """ファイルを削除する。可能ならゴミ箱へ移動し、失敗したら通常削除する。
+
+    戻り値は "trash" / "deleted"。
+    """
+    if use_recycle_bin and SEND2TRASH_AVAILABLE:
+        try:
+            send2trash(str(path))
+            return "trash"
+        except Exception:
+            pass
+    os.remove(path)
+    return "deleted"
+
+
+def free_space_gb(path):
+    """保存先を含むドライブの空き容量(GB)。取得できなければ None。"""
+    try:
+        os.makedirs(path, exist_ok=True)
+        return shutil.disk_usage(path).free / (1024 ** 3)
+    except OSError:
+        return None
+
+
+def check_free_space(cfg, files, log):
+    """処理対象の合計サイズと保存先の空き容量を比較して警告する。"""
+    try:
+        total = sum(os.path.getsize(f) for f in files)
+    except OSError:
+        return
+    if total <= 0:
+        return
+    total_gb = total / (1024 ** 3)
+    # Original は入力と同量、Mobile はおおよそ半分と見積もる
+    for label, path, ratio in (("Original", original_dir(cfg), 1.0),
+                               ("Mobile", mobile_dir(cfg), 0.5)):
+        free = free_space_gb(path)
+        if free is None:
+            continue
+        need = total_gb * ratio
+        if free < need:
+            log("WARN", f"{label} の空き容量が不足するおそれがあります"
+                        f"（空き {free:.1f} GB / 必要目安 {need:.1f} GB）")
+
+
+# ---------------------------------------------------------------- 重複したファイルの扱い
+DUPLICATE_ACTIONS = {
+    "keep": "取り込みに残す",
+    "move": "Duplicates へ退避",
+    "delete": "削除する",
+}
+
+
+def duplicate_dir(cfg):
+    return os.path.join(work_dir(cfg), "Duplicates")
+
+
+def move_to_duplicates(path, cfg):
+    """重複したファイルを Duplicates フォルダへ移す。"""
+    d = duplicate_dir(cfg)
+    os.makedirs(d, exist_ok=True)
+    dest = unique_path(d, os.path.basename(path))
+    shutil.move(path, dest)
+    return dest
+
+
+def effective_duplicate_action(cfg):
+    action = cfg.get("duplicate_action", "keep")
+    # 旧設定(delete_duplicates)との互換
+    if cfg.get("delete_duplicates") and action == "keep":
+        action = "delete"
+    return action if action in DUPLICATE_ACTIONS else "keep"
+
+
+def handle_duplicate(path, cfg, label, log):
+    """重複と判定したファイルを設定に従って処理する。
+
+    取り込み元に残した場合は True、移動/削除した場合は False を返す。
+    """
+    name = os.path.basename(path)
+    action = effective_duplicate_action(cfg)
+    if action == "delete":
+        try:
+            delete_file(path, cfg.get("use_recycle_bin", True))
+            log("INFO", f"重複スキップ（{label}・削除）: {name}")
+            return False
+        except OSError as e:
+            log("WARN", f"重複ファイルを削除できません: {name} ({e})")
+            return True
+    if action == "move":
+        try:
+            dest = move_to_duplicates(path, cfg)
+            log("INFO", f"重複スキップ（{label}・退避）: {name} → {dest}")
+            return False
+        except OSError as e:
+            log("WARN", f"重複ファイルを退避できません: {name} ({e})")
+            return True
+    log("INFO", f"重複スキップ（{label}・取り込みに残します）: {name}")
+    return True
 
 
 # ---------------------------------------------------------------- pHash の保存・照合
@@ -452,7 +585,7 @@ def process_image(src, cfg, checker, stats):
     dest_orig_dir = os.path.join(original_dir(cfg), layout_subfolder(dt, cfg["layout"]))
     os.makedirs(dest_orig_dir, exist_ok=True)
     dest_orig = unique_path(dest_orig_dir, os.path.basename(src))
-    shutil.copy2(src, dest_orig)
+    copy_verified(src, dest_orig)
 
     # 2) リサイズして Mobile へ出力
     img = oriented
@@ -590,7 +723,7 @@ def process_video(src, cfg, stats, cancel_event=None):
     dest_orig_dir = os.path.join(original_dir(cfg), layout_subfolder(dt, cfg["layout"]))
     os.makedirs(dest_orig_dir, exist_ok=True)
     dest_orig = unique_path(dest_orig_dir, os.path.basename(src))
-    shutil.copy2(src, dest_orig)
+    copy_verified(src, dest_orig)
 
     # 圧縮して Mobile へ出力(コンテナは MP4 に統一)
     dest_mobile_dir = os.path.join(mobile_dir(cfg), layout_subfolder(dt, cfg["layout"]))
@@ -781,6 +914,7 @@ def run_processing(cfg, q, cancel_event=None):
     total = len(files)
     q.put(("start", total))
     log("INFO", f"処理開始: {total} 件 ({intake})")
+    check_free_space(cfg, files, log)
 
     checker = DuplicateChecker(cfg, log)
     if checker.enabled:
@@ -807,6 +941,7 @@ def run_processing(cfg, q, cancel_event=None):
         name = os.path.basename(p)
         ext = os.path.splitext(name)[1].lower()
         keep_in_intake = False
+        dup_handled = False
         try:
             if ext in IMAGE_EXTS:
                 result = process_image(p, cfg, checker, stats)
@@ -816,13 +951,8 @@ def run_processing(cfg, q, cancel_event=None):
                     if reason == "name":
                         skipped_name += 1
                     label = "同名ファイルあり" if reason == "name" else "類似画像"
-                    # 重複と判定したファイルは原本も Mobile も作られていない。
-                    # 誤判定だった場合に取り返しがつかないため、既定では残す。
-                    if not cfg.get("delete_duplicates", False):
-                        keep_in_intake = True
-                        log("INFO", f"重複スキップ（{label}・取り込みに残します）: {name}")
-                    else:
-                        log("INFO", f"重複スキップ（{label}）: {name}")
+                    dup_handled = True
+                    keep_in_intake = handle_duplicate(p, cfg, label, log)
                 else:
                     log("INFO", f"画像処理: {name}")
             else:
@@ -830,9 +960,9 @@ def run_processing(cfg, q, cancel_event=None):
                 log("INFO", f"動画圧縮: {name}")
 
             # 成功したら、設定に応じて取り込み元から削除
-            if cfg["delete_after_process"] and not keep_in_intake:
+            if cfg["delete_after_process"] and not keep_in_intake and not dup_handled:
                 try:
-                    os.remove(p)
+                    delete_file(p, cfg.get("use_recycle_bin", True))
                     log("INFO", f"取り込みから削除: {name}")
                 except OSError as e:
                     log("WARN", f"削除に失敗: {name} ({e})")
@@ -957,18 +1087,27 @@ class App(tk.Tk):
             f_dedup, from_=0, to=20, width=5, textvariable=self.threshold_var)
         self.threshold_spin.pack(side="left", padx=4)
 
+        # 重複と判定したファイルの扱い
+        f_dupact = ttk.Frame(f_set)
+        f_dupact.grid(row=2, column=0, columnspan=2, sticky="w", padx=6, pady=2)
+        ttk.Label(f_dupact, text="　重複時の扱い:").pack(side="left")
+        self.dup_action_combo = ttk.Combobox(
+            f_dupact, state="readonly", width=18,
+            values=list(DUPLICATE_ACTIONS.values()))
+        self.dup_action_combo.pack(side="left", padx=4)
+
         self.delete_var = tk.BooleanVar(value=False)
         self.subdir_var = tk.BooleanVar(value=True)
         self.video_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(f_set, text="処理後に取り込みフォルダから削除する",
                         variable=self.delete_var).grid(
-            row=2, column=0, columnspan=2, sticky="w", padx=6)
+            row=3, column=0, columnspan=2, sticky="w", padx=6)
         ttk.Checkbutton(f_set, text="サブフォルダも対象にする(DCIM\\Camera などの階層に対応)",
                         variable=self.subdir_var).grid(
-            row=3, column=0, columnspan=2, sticky="w", padx=6)
+            row=4, column=0, columnspan=2, sticky="w", padx=6)
         ttk.Checkbutton(f_set, text="動画も圧縮する(要 FFmpeg)",
                         variable=self.video_var).grid(
-            row=4, column=0, columnspan=2, sticky="w", padx=6)
+            row=5, column=0, columnspan=2, sticky="w", padx=6)
 
         # 圧縮の程度
         f_comp = ttk.LabelFrame(self, text="圧縮の程度")
@@ -1039,11 +1178,12 @@ class App(tk.Tk):
         self._toggle_dedup()
 
     def _toggle_dedup(self):
-        """重複スキップがオフのときは、方式としきい値を操作できないようにする。"""
+        """重複スキップがオフのときは、方式・しきい値・扱いを操作できないようにする。"""
         enabled = self.dedup_var.get()
         mode = self._dedup_mode_key()
         try:
             self.dedup_mode_combo.config(state="readonly" if enabled else "disabled")
+            self.dup_action_combo.config(state="readonly" if enabled else "disabled")
             # ファイル名方式では pHash のしきい値を使わない
             spin_state = "normal" if (enabled and mode in ("phash", "both")) else "disabled"
             self.threshold_spin.config(state=spin_state)
@@ -1056,6 +1196,13 @@ class App(tk.Tk):
             if text == label:
                 return key
         return "phash"
+
+    def _dup_action_key(self):
+        label = self.dup_action_combo.get()
+        for key, text in DUPLICATE_ACTIONS.items():
+            if text == label:
+                return key
+        return "keep"
 
     def _apply_preset(self, _event=None):
         values = COMPRESSION_PRESETS.get(self.preset_combo.get())
@@ -1097,6 +1244,9 @@ class App(tk.Tk):
         self.dedup_var.set(bool(self.cfg.get("enable_dedup", False)))
         mode = self.cfg.get("dedup_mode", "phash")
         self.dedup_mode_combo.set(DEDUP_MODES.get(mode, DEDUP_MODES["phash"]))
+        action = self.cfg.get("duplicate_action", "keep")
+        self.dup_action_combo.set(
+            DUPLICATE_ACTIONS.get(action, DUPLICATE_ACTIONS["keep"]))
         self.threshold_var.set(str(self.cfg["phash_threshold"]))
         self._toggle_dedup()
         self.long_side_var.set(str(self.cfg["image_long_side"]))
@@ -1123,6 +1273,9 @@ class App(tk.Tk):
         self.cfg["compress_video"] = bool(self.video_var.get())
         self.cfg["enable_dedup"] = bool(self.dedup_var.get())
         self.cfg["dedup_mode"] = self._dedup_mode_key()
+        self.cfg["duplicate_action"] = self._dup_action_key()
+        # 旧設定との互換のため合わせて更新する
+        self.cfg["delete_duplicates"] = self.cfg["duplicate_action"] == "delete"
         self.cfg["phash_threshold"] = self._int_or(
             self.threshold_var.get(), DEFAULT_CONFIG["phash_threshold"], 0, 20)
         self.cfg["image_long_side"] = self._int_or(
