@@ -19,6 +19,11 @@ Duplicates/
 .env.*
 !.env.example
 
+# ビルド成果物
+build/
+dist/
+*.manifest
+
 # OS / エディタ
 Thumbs.db
 desktop.ini

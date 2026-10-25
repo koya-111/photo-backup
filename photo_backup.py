@@ -30,6 +30,7 @@ import queue
 import re
 import shutil
 import subprocess
+import sys
 import threading
 import time
 import tkinter as tk
@@ -170,7 +171,11 @@ LAYOUT_STRFTIME = {
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".heic", ".heif"}
 VIDEO_EXTS = {".mp4", ".mov"}
 
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+if getattr(sys, "frozen", False):
+    # exe 化した場合、__file__ は一時展開先を指すため exe の場所を使う
+    SCRIPT_DIR = os.path.dirname(os.path.abspath(sys.executable))
+else:
+    SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 
 # ---------------------------------------------------------------- 設定の読み書き

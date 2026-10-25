@@ -29,7 +29,8 @@ pip install -r requirements.txt
 
 ## 起動
 
-`photo_backup.bat` をダブルクリックします。
+- ソースから: `photo_backup.bat` をダブルクリック
+- exe 版: `dist\PhotoBackup\PhotoBackup.exe` をダブルクリック（下記「exe にする」参照）
 
 ## ファイル構成
 
@@ -38,7 +39,27 @@ pip install -r requirements.txt
 | `photo_backup.py` | 本体（GUI とバックアップ処理） |
 | `photo_backup.bat` | 起動用ランチャー（Python を自動検出） |
 | `requirements.txt` | 依存ライブラリ |
+| `requirements-build.txt` | exe 作成用（PyInstaller） |
+| `photo_backup.spec` | PyInstaller 設定（フォルダ配布版・推奨） |
+| `photo_backup_onefile.spec` | PyInstaller 設定（1 ファイル版） |
+| `build_exe.bat` | exe をビルドするスクリプト |
 | `使い方.md` | 詳しい利用手順・設定一覧・トラブルシューティング |
+
+## exe にする
+
+Python が入っていない PC でも動くよう、1 つのフォルダにまとめられます。
+
+```powershell
+pip install -r requirements-build.txt
+```
+
+その後 `build_exe.bat` をダブルクリックします（または `python -m PyInstaller --noconfirm --clean photo_backup.spec`）。
+
+- 出力: `dist\PhotoBackup\PhotoBackup.exe`（**フォルダごと**コピーして使います）
+- `config.json` は **exe と同じフォルダ**に作られます。書き込みできない場所（`C:\Program Files` 直下など）に置くと設定を保存できません
+- `config_profiles.json` / `processed.json` も同じ考え方で保存されます
+- **FFmpeg は同梱されません**。動画圧縮を使う場合は別途導入し、`ffmpeg_path` を設定してください
+- 1 ファイルにまとめたい場合は `photo_backup_onefile.spec` でビルドします。初回起動に数秒かかり、一時フォルダへ書き込めない環境では起動できません
 
 ## 既定のフォルダ
 
