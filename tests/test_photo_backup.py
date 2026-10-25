@@ -183,14 +183,40 @@ def test_end_to_end(tmp):
     assert os.path.exists(os.path.join(work, "backup_log.txt")), "ログが work_dir に無い"
     assert not os.path.exists(os.path.join(work, "Original")), "work_dir に Original が出来ている"
 
-    # 既定では取り込み元が空になり、空フォルダも片付く
+    # 既定では取り込み元が空にならず、削除したものだけが消える
     remaining = [n for _, _, names in os.walk(intake) for n in names]
-    assert not remaining, f"取り込み元にファイルが残っている: {remaining}"
-    assert not os.path.exists(os.path.join(intake, "DCIM")), "空フォルダが残っている"
+    assert remaining == ["a_copy.jpg"], f"取り込み元の残り方が不正: {remaining}"
+    assert os.path.exists(os.path.join(intake, "DCIM")), "空でないフォルダが消えている"
 
     with open(os.path.join(work, "hashes.json"), encoding="utf-8") as f:
         assert len(json.load(f)["hashes"]) == 2, "ハッシュDBの件数が不正"
     print("  end-to-end: OK")
+
+
+def test_delete_defaults(tmp):
+    """削除は既定でオフ。重複スキップ分は delete_duplicates を有効にしない限り残る。"""
+    assert pb.DEFAULT_CONFIG["delete_after_process"] is False, "削除の既定がオンになっている"
+    assert pb.DEFAULT_CONFIG["delete_duplicates"] is False, "重複削除の既定がオンになっている"
+
+    intake = os.path.join(tmp, "del_intake")
+    make_image(os.path.join(intake, "x.jpg"), 11)
+    shutil.copy2(os.path.join(intake, "x.jpg"), os.path.join(intake, "x_copy.jpg"))
+
+    # delete_after_process=True でも重複は残す(既定)
+    cfg = dict(pb.DEFAULT_CONFIG, intake_dir=intake,
+               original_dir=os.path.join(tmp, "del_orig"),
+               mobile_dir=os.path.join(tmp, "del_mob"),
+               work_dir=os.path.join(tmp, "del_work"),
+               delete_after_process=True)
+    pb.run_processing(cfg, queue.Queue())
+    left = sorted(os.listdir(intake))
+    assert left == ["x_copy.jpg"], f"重複が削除された: {left}"
+
+    # delete_duplicates=True なら重複も削除する
+    cfg["delete_duplicates"] = True
+    pb.run_processing(cfg, queue.Queue())
+    assert os.listdir(intake) == [], "delete_duplicates=True で重複が残った"
+    print("  delete defaults: OK")
 
 
 def test_compression_settings(tmp):
@@ -224,6 +250,7 @@ def main():
         test_config_migration(tmp)
         test_end_to_end(tmp)
         test_compression_settings(tmp)
+        test_delete_defaults(tmp)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
     print("すべて成功")

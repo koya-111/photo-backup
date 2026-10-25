@@ -114,7 +114,8 @@ DEFAULT_CONFIG = {
     "work_dir": r"C:\PhotoBackup",             # ログ・重複判定DBの保存先
     "layout": "YYYY\\MM",                      # 整理方法: flat / YYYY / YYYY\MM / YYYY\MM\DD
     "include_subfolders": True,                # 取り込みフォルダのサブフォルダも対象にするか
-    "delete_after_process": True,              # 処理後に取り込みフォルダから削除するか
+    "delete_after_process": False,             # 処理後に取り込みフォルダから削除するか(既定は残す)
+    "delete_duplicates": False,                # 重複スキップしたファイルも取り込みから削除するか
     "compress_video": False,                   # 動画も圧縮するか
     "phash_threshold": 5,                      # pHash ハミング距離のしきい値(これ以下で重複扱い)
     "image_long_side": 1200,                   # スマホ戻し用画像の長辺ピクセル
@@ -673,20 +674,27 @@ def run_processing(cfg, q):
     for i, p in enumerate(files, 1):
         name = os.path.basename(p)
         ext = os.path.splitext(name)[1].lower()
+        keep_in_intake = False
         try:
             if ext in IMAGE_EXTS:
                 result = process_image(p, cfg, hash_store, stats)
                 if result == "duplicate":
                     skipped_dup += 1
-                    log("INFO", f"重複スキップ: {name}")
+                    # 重複と判定したファイルは原本も Mobile も作られていない。
+                    # 誤判定だった場合に取り返しがつかないため、既定では残す。
+                    if not cfg.get("delete_duplicates", False):
+                        keep_in_intake = True
+                        log("INFO", f"重複スキップ（取り込みに残します）: {name}")
+                    else:
+                        log("INFO", f"重複スキップ: {name}")
                 else:
                     log("INFO", f"画像処理: {name}")
             else:
                 process_video(p, cfg, stats)
                 log("INFO", f"動画圧縮: {name}")
 
-            # 成功(重複スキップ含む)したら、設定に応じて取り込み元から削除
-            if cfg["delete_after_process"]:
+            # 成功したら、設定に応じて取り込み元から削除
+            if cfg["delete_after_process"] and not keep_in_intake:
                 try:
                     os.remove(p)
                     log("INFO", f"取り込みから削除: {name}")
@@ -791,7 +799,7 @@ class App(tk.Tk):
                     textvariable=self.threshold_var).grid(
             row=1, column=1, sticky="w", padx=6, pady=2)
 
-        self.delete_var = tk.BooleanVar(value=True)
+        self.delete_var = tk.BooleanVar(value=False)
         self.subdir_var = tk.BooleanVar(value=True)
         self.video_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(f_set, text="処理後に取り込みフォルダから削除する",
