@@ -23,6 +23,7 @@ Android スマホ写真 バックアップ＆軽量化・同期ツール
 設定は初回起動時(および実行時)に config.json として自動保存されます。
 """
 
+import io
 import json
 import os
 import queue
@@ -134,7 +135,10 @@ DEFAULT_CONFIG = {
     "image_long_side": 1200,                   # スマホ戻し用画像の長辺ピクセル
     "jpeg_quality": 80,                        # JPEG 品質(1〜100)
     "video_crf": 28,                           # 動画圧縮の CRF(小さいほど高画質・大容量)
-    "video_preset": "medium",                  # libx265 のプリセット
+    "video_preset": "medium",                  # libx265 / libx264 のプリセット
+    "video_codec": "hevc",                     # 動画コーデック: hevc / h264
+    "mobile_format": "jpg",                    # Mobile の出力形式: jpg / heic(HEIC 入力のみ)
+    "workers": 1,                              # 画像処理の並列数(1 で逐次)
     "ffmpeg_path": "ffmpeg",                   # ffmpeg 実行パス(PATH に入っていれば "ffmpeg")
 }
 
@@ -705,7 +709,11 @@ def get_photo_datetime(im, src):
 
 
 # ---------------------------------------------------------------- 画像処理
-def process_image(src, cfg, checker, stats):
+def prepare_image(src, cfg):
+    """画像を読み、pHash・撮影日時・縮小データを用意する(保存はしない)。
+
+    並列処理でも安全なように、ファイルの書き込みは行わない。
+    """
     with Image.open(src) as im:
         im.load()
         exif = im.getexif()
@@ -723,58 +731,127 @@ def process_image(src, cfg, checker, stats):
         # pHash は向き適用後の画像から算出(向きの違いで別物扱いされないように)
         ph = imagehash.phash(oriented.convert("RGB"), hash_size=8)
 
-    # 重複スキップは既定でオフ。オンのときだけ判定する。
-    # オフでもハッシュは記録しておき、後から有効にしたときに活かせるようにする。
-    reason = checker.check(ph, src)
-    if reason:
-        return f"duplicate:{reason}"
+        img = oriented
+        if img.mode in ("RGBA", "LA", "P"):
+            # アルファ(透過)がある場合は白背景に合成
+            img = img.convert("RGBA")
+            bg = Image.new("RGB", img.size, (255, 255, 255))
+            bg.paste(img, mask=img.split()[-1])
+            img = bg
+        elif img.mode != "RGB":
+            img = img.convert("RGB")
+
+        img.thumbnail((cfg["image_long_side"], cfg["image_long_side"]), Image.LANCZOS)
+
+        try:
+            exif[0x0112] = 1  # 向き適用済みなので Orientation を「正立」に正規化
+        except Exception:
+            pass
+
+        save_kwargs = {"quality": cfg["jpeg_quality"], "optimize": True}
+        try:
+            exif_bytes = exif.tobytes()
+            if exif_bytes:
+                save_kwargs["exif"] = exif_bytes  # 撮影日時・GPS などを可能な限り保持
+        except Exception:
+            pass
+        if icc:
+            save_kwargs["icc_profile"] = icc  # 色プロファイルを保持
+
+        data = None
+        out_ext = ".jpg"
+        # HEIC のまま出力(色域・HDR を保ちたい場合)
+        if (cfg.get("mobile_format") == "heic" and HEIF_AVAILABLE
+                and os.path.splitext(src)[1].lower() in (".heic", ".heif")):
+            try:
+                buf = io.BytesIO()
+                img.save(buf, "HEIF", quality=cfg["jpeg_quality"])
+                data = buf.getvalue()
+                out_ext = ".heic"
+            except Exception:
+                data = None
+
+        if data is None:
+            buf = io.BytesIO()
+            img.save(buf, "JPEG", **save_kwargs)
+            data = buf.getvalue()
+
+    return {"src": src, "phash": ph, "dt": dt, "data": data, "ext": out_ext}
+
+
+def write_prepared(prep, cfg, checker, stats):
+    """prepare_image の結果を実際に保存する。"""
+    src = prep["src"]
+    dt = prep["dt"]
 
     # 1) 元画像を Original へコピー
     dest_orig_dir = os.path.join(original_dir(cfg), layout_subfolder(dt, cfg["layout"]))
     os.makedirs(dest_orig_dir, exist_ok=True)
-    dest_orig = unique_path(dest_orig_dir, os.path.basename(src))
-    copy_verified(src, dest_orig)
+    copy_verified(src, unique_path(dest_orig_dir, os.path.basename(src)))
 
-    # 2) リサイズして Mobile へ出力
-    img = oriented
-    if img.mode in ("RGBA", "LA", "P"):
-        # アルファ(透過)がある場合は白背景に合成
-        img = img.convert("RGBA")
-        bg = Image.new("RGB", img.size, (255, 255, 255))
-        bg.paste(img, mask=img.split()[-1])
-        img = bg
-    elif img.mode != "RGB":
-        img = img.convert("RGB")
-
-    img.thumbnail((cfg["image_long_side"], cfg["image_long_side"]), Image.LANCZOS)
-
-    try:
-        exif[0x0112] = 1  # 向き適用済みなので Orientation を「正立」に正規化
-    except Exception:
-        pass
-
+    # 2) 縮小済みデータを Mobile へ書き出し
     dest_mobile_dir = os.path.join(mobile_dir(cfg), layout_subfolder(dt, cfg["layout"]))
     os.makedirs(dest_mobile_dir, exist_ok=True)
-    base, _ = os.path.splitext(os.path.basename(src))
-    dest_mobile = unique_path(dest_mobile_dir, base + ".jpg")
+    base = os.path.splitext(os.path.basename(src))[0]
+    dest_mobile = unique_path(dest_mobile_dir, base + prep["ext"])
+    with open(dest_mobile, "wb") as f:
+        f.write(prep["data"])
 
-    save_kwargs = {"quality": cfg["jpeg_quality"], "optimize": True}
-    try:
-        exif_bytes = exif.tobytes()
-        if exif_bytes:
-            save_kwargs["exif"] = exif_bytes  # 撮影日時・GPS などを可能な限り保持
-    except Exception:
-        pass
-    if icc:
-        save_kwargs["icc_profile"] = icc  # 色プロファイルを保持
-    img.save(dest_mobile, "JPEG", **save_kwargs)
-
-    checker.accept(ph, src)
+    checker.accept(prep["phash"], src)
 
     stats["images"] += 1
     stats["orig_bytes"] += os.path.getsize(src)
     stats["new_bytes"] += os.path.getsize(dest_mobile)
+    return dest_mobile
+
+
+def process_image(src, cfg, checker, stats):
+    """1 枚を処理する(重複判定込み)。"""
+    prep = prepare_image(src, cfg)
+    reason = checker.check(prep["phash"], src)
+    if reason:
+        return f"duplicate:{reason}"
+    write_prepared(prep, cfg, checker, stats)
     return "ok"
+
+
+def iter_prepared(files, cfg, workers, cancel_event=None):
+    """prepare_image を順に返す。workers > 1 のときは先読みして並列実行する。"""
+    if workers <= 1:
+        for f in files:
+            if cancel_event is not None and cancel_event.is_set():
+                return
+            try:
+                yield prepare_image(f, cfg)
+            except Exception as e:
+                yield {"src": f, "error": str(e), "phash": None}
+        return
+
+    from concurrent.futures import ThreadPoolExecutor
+
+    window = max(2, workers * 3)
+    pending = []
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        it = iter(files)
+        exhausted = False
+        while True:
+            while not exhausted and len(pending) < window:
+                if cancel_event is not None and cancel_event.is_set():
+                    exhausted = True
+                    break
+                try:
+                    f = next(it)
+                except StopIteration:
+                    exhausted = True
+                    break
+                pending.append((f, ex.submit(prepare_image, f, cfg)))
+            if not pending:
+                return
+            f, future = pending.pop(0)
+            try:
+                yield future.result()
+            except Exception as e:
+                yield {"src": f, "error": str(e), "phash": None}
 
 
 # ---------------------------------------------------------------- 動画の撮影日時
@@ -860,8 +937,50 @@ class Cancelled(Exception):
     """ユーザーが中止を要求したときに送出する。"""
 
 
+# ---------------------------------------------------------------- 動画の追加情報
+VIDEO_CODECS = {
+    "hevc": "H.265（HEVC・高圧縮）",
+    "h264": "H.264（互換性重視）",
+}
+
+
+def probe_streams(src, ffmpeg_path):
+    """動画の長さと音声コーデックを ffprobe で調べる。"""
+    info = {"duration": None, "audio": None}
+    ffprobe = resolve_ffprobe(ffmpeg_path)
+    if not ffprobe:
+        return info
+    base = [ffprobe, "-v", "error", "-show_entries"]
+    try:
+        proc = subprocess.run(
+            base + ["format=duration:stream=codec_type,codec_name", "-of", "json", src],
+            capture_output=True, text=True, timeout=30)
+        if proc.returncode == 0:
+            data = json.loads(proc.stdout or "{}")
+            try:
+                info["duration"] = float(data.get("format", {}).get("duration"))
+            except (TypeError, ValueError):
+                info["duration"] = None
+            for stream in data.get("streams", []):
+                if stream.get("codec_type") == "audio":
+                    info["audio"] = stream.get("codec_name")
+                    break
+    except Exception:
+        pass
+    return info
+
+
+def _parse_out_time(value):
+    """ffmpeg の -progress が出す HH:MM:SS.micro を秒に直す。"""
+    try:
+        h, m, s = value.strip().split(":")
+        return int(h) * 3600 + int(m) * 60 + float(s)
+    except Exception:
+        return None
+
+
 # ---------------------------------------------------------------- 動画処理
-def process_video(src, cfg, stats, cancel_event=None):
+def process_video(src, cfg, stats, cancel_event=None, progress_cb=None):
     dt = get_video_datetime(src, cfg.get("ffmpeg_path"))
 
     if cancel_event is not None and cancel_event.is_set():
@@ -879,41 +998,80 @@ def process_video(src, cfg, stats, cancel_event=None):
     base, _ = os.path.splitext(os.path.basename(src))
     dest_mobile = unique_path(dest_mobile_dir, base + ".mp4")
 
-    cmd = [
-        cfg["ffmpeg_path"], "-y", "-i", src,
-        "-map", "0:v:0", "-map", "0:a?",
-        "-c:v", "libx265",
-        "-crf", str(cfg["video_crf"]),
-        "-preset", cfg["video_preset"],
-        "-tag:v", "hvc1",
-        "-c:a", "aac", "-b:a", "128k",
-        "-movflags", "+faststart",
-        "-nostats", "-loglevel", "error",
-        dest_mobile,
-    ]
+    probe = probe_streams(src, cfg.get("ffmpeg_path"))
+    duration = probe["duration"]
+    audio = probe["audio"]
+    # 音声が既に AAC なら再エンコードせずコピーする(劣化なし・高速)
+    if audio == "aac":
+        audio_args = ["-c:a", "copy"]
+    else:
+        audio_args = ["-c:a", "aac", "-b:a", "128k"]
+
+    codec = cfg.get("video_codec", "hevc")
+    if codec == "h264":
+        video_args = ["-c:v", "libx264", "-crf", str(cfg["video_crf"]),
+                      "-preset", cfg["video_preset"], "-tag:v", "avc1",
+                      "-pix_fmt", "yuv420p"]
+    else:
+        video_args = ["-c:v", "libx265", "-crf", str(cfg["video_crf"]),
+                      "-preset", cfg["video_preset"], "-tag:v", "hvc1"]
+
+    cmd = ([cfg["ffmpeg_path"], "-y", "-i", src,
+            "-map", "0:v:0", "-map", "0:a?"]
+           + video_args + audio_args
+           + ["-movflags", "+faststart",
+              "-progress", "pipe:1", "-nostats", "-loglevel", "error",
+              dest_mobile])
     # 中止要求にすぐ反応できるよう、完了を待たずに一定間隔で状態を見る
-    proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL,
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
                             stderr=subprocess.PIPE, text=True)
+    err_lines = []
+
+    def read_stdout():
+        for line in proc.stdout:
+            if not line.startswith("out_time="):
+                continue
+            seconds = _parse_out_time(line.split("=", 1)[1])
+            if seconds is None or not duration or duration <= 0:
+                continue
+            if progress_cb:
+                try:
+                    progress_cb(min(99.0, seconds / duration * 100.0))
+                except Exception:
+                    pass
+
+    reader = threading.Thread(target=read_stdout, daemon=True)
+    reader.start()
     try:
         while True:
             try:
-                _, err = proc.communicate(timeout=0.5)
+                proc.wait(timeout=0.5)
                 break
             except subprocess.TimeoutExpired:
                 if cancel_event is not None and cancel_event.is_set():
                     proc.kill()
-                    proc.communicate()
                     raise Cancelled()
     finally:
         if proc.poll() is None:
             proc.kill()
-            proc.communicate()
+            proc.wait()
+        reader.join(timeout=2)
+        tail_err = ""
+        try:
+            tail_err = (proc.stderr.read() or "")
+        except Exception:
+            pass
+        try:
+            proc.stdout.close()
+            proc.stderr.close()
+        except Exception:
+            pass
 
     if proc.returncode != 0:
         if cancel_event is not None and cancel_event.is_set():
             _remove_quietly(dest_mobile)
             raise Cancelled()
-        tail = (err or "").strip()[-500:]
+        tail = tail_err.strip()[-500:]
         raise RuntimeError(f"FFmpeg が失敗: {tail}")
 
     stats["videos"] += 1
@@ -1083,37 +1241,69 @@ def run_processing(cfg, q, cancel_event=None):
     skipped_dup = 0
     skipped_name = 0
     errors = 0
+    progress_done = 0
 
-    for i, p in enumerate(files, 1):
+    image_files = [p for p in files if os.path.splitext(p)[1].lower() in IMAGE_EXTS]
+    movie_files = [p for p in files if os.path.splitext(p)[1].lower() in VIDEO_EXTS]
+    workers = max(1, int(cfg.get("workers", 1) or 1))
+    if workers > 1:
+        log("INFO", f"画像の並列処理: {workers} スレッド")
+
+    # --- 画像 ---
+    for prep in iter_prepared(image_files, cfg, workers, cancel_event):
         if is_cancelled():
             cancelled = True
             log("WARN", "中止要求を受け付けたため、残りのファイルを処理せず停止しました。")
             break
-        name = os.path.basename(p)
-        ext = os.path.splitext(name)[1].lower()
-        keep_in_intake = False
-        dup_handled = False
+        src = prep["src"]
+        name = os.path.basename(src)
+        progress_done += 1
         try:
-            if ext in IMAGE_EXTS:
-                result = process_image(p, cfg, checker, stats)
-                if result.startswith("duplicate"):
-                    skipped_dup += 1
-                    reason = result.split(":", 1)[1] if ":" in result else "phash"
-                    if reason == "name":
-                        skipped_name += 1
-                    label = {"name": "同名ファイルあり",
-                             "ledger": "処理済み",
-                             "phash": "類似画像"}.get(reason, "類似画像")
-                    dup_handled = True
-                    keep_in_intake = handle_duplicate(p, cfg, label, log)
-                else:
-                    log("INFO", f"画像処理: {name}")
+            if prep.get("error"):
+                raise RuntimeError(prep["error"])
+            reason = checker.check(prep["phash"], src)
+            if reason:
+                skipped_dup += 1
+                if reason == "name":
+                    skipped_name += 1
+                label = {"name": "同名ファイルあり",
+                         "ledger": "処理済み",
+                         "phash": "類似画像"}.get(reason, "類似画像")
+                handle_duplicate(src, cfg, label, log)
             else:
-                process_video(p, cfg, stats, cancel_event)
-                log("INFO", f"動画圧縮: {name}")
+                write_prepared(prep, cfg, checker, stats)
+                log("INFO", f"画像処理: {name}")
+                if cfg["delete_after_process"]:
+                    try:
+                        delete_file(src, cfg.get("use_recycle_bin", True))
+                        log("INFO", f"取り込みから削除: {name}")
+                    except OSError as e:
+                        log("WARN", f"削除に失敗: {name} ({e})")
+        except Exception as e:
+            errors += 1
+            log("ERROR", f"処理失敗: {name} ({e})")
 
-            # 成功したら、設定に応じて取り込み元から削除
-            if cfg["delete_after_process"] and not keep_in_intake and not dup_handled:
+        q.put(("progress", progress_done, total))
+
+    # --- 動画 ---
+    for p in movie_files:
+        if cancelled or is_cancelled():
+            cancelled = True
+            log("WARN", "中止要求を受け付けたため、残りのファイルを処理せず停止しました。")
+            break
+        name = os.path.basename(p)
+        progress_done += 1
+        try:
+            last = {"pct": 0.0}
+
+            def report(pct, _name=name, _last=last):
+                if pct - _last["pct"] >= 2:
+                    _last["pct"] = pct
+                    q.put(("video_progress", pct, _name))
+
+            process_video(p, cfg, stats, cancel_event, report)
+            log("INFO", f"動画圧縮: {name}")
+            if cfg["delete_after_process"]:
                 try:
                     delete_file(p, cfg.get("use_recycle_bin", True))
                     log("INFO", f"取り込みから削除: {name}")
@@ -1127,7 +1317,12 @@ def run_processing(cfg, q, cancel_event=None):
             errors += 1
             log("ERROR", f"処理失敗: {name} ({e})")
 
-        q.put(("progress", i, total))
+        q.put(("progress", progress_done, total))
+
+    # 1 件も処理せずに中止した場合も、その旨を残す
+    if is_cancelled() and not cancelled:
+        cancelled = True
+        log("WARN", "中止要求を受け付けたため、残りのファイルを処理せず停止しました。")
 
     checker.save()
 
@@ -1323,10 +1518,26 @@ class App(tk.Tk):
         ttk.Spinbox(f_num, from_=0, to=51, increment=1, width=5,
                     textvariable=self.crf_var).pack(side="left", padx=4)
 
+        f_opt = ttk.Frame(f_comp)
+        f_opt.grid(row=2, column=0, columnspan=4, sticky="ew", padx=6, pady=2)
+        self.video_codec_var = tk.StringVar(value="hevc")
+        ttk.Label(f_opt, text="動画コーデック:").pack(side="left")
+        self.codec_combo = ttk.Combobox(
+            f_opt, state="readonly", width=20, values=list(VIDEO_CODECS.values()))
+        self.codec_combo.pack(side="left", padx=(4, 12))
+        self.heic_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(f_opt, text="HEIC は HEIC のまま出力",
+                        variable=self.heic_var).pack(side="left", padx=(0, 12))
+        ttk.Label(f_opt, text="並列:").pack(side="left")
+        self.workers_var = tk.StringVar(value="1")
+        ttk.Spinbox(f_opt, from_=1, to=16, increment=1, width=4,
+                    textvariable=self.workers_var).pack(side="left", padx=4)
+        ttk.Label(f_opt, text="スレッド").pack(side="left")
+
         ttk.Label(f_comp, foreground="#555",
                   text="長辺を小さく・品質を下げる・CRF を上げるほど容量が減ります"
                        "（動画 CRF は 18〜32 が目安）。").grid(
-            row=2, column=0, columnspan=4, sticky="w", padx=6, pady=(0, 4))
+            row=3, column=0, columnspan=4, sticky="w", padx=6, pady=(0, 4))
 
         # 実行
         f_run = ttk.Frame(self)
@@ -1566,6 +1777,11 @@ class App(tk.Tk):
         self.long_side_var.set(str(self.cfg["image_long_side"]))
         self.quality_var.set(str(self.cfg["jpeg_quality"]))
         self.crf_var.set(str(self.cfg["video_crf"]))
+        self.video_codec_var.set(self.cfg.get("video_codec", "hevc"))
+        self.codec_combo.set(VIDEO_CODECS.get(
+            self.cfg.get("video_codec", "hevc"), VIDEO_CODECS["hevc"]))
+        self.heic_var.set(self.cfg.get("mobile_format", "jpg") == "heic")
+        self.workers_var.set(str(self.cfg.get("workers", 1)))
 
         current = (self.cfg["image_long_side"], self.cfg["jpeg_quality"],
                    self.cfg["video_crf"])
@@ -1600,6 +1816,12 @@ class App(tk.Tk):
             self.quality_var.get(), DEFAULT_CONFIG["jpeg_quality"], 30, 100)
         self.cfg["video_crf"] = self._int_or(
             self.crf_var.get(), DEFAULT_CONFIG["video_crf"], 0, 51)
+        label = self.codec_combo.get()
+        self.cfg["video_codec"] = next(
+            (k for k, v in VIDEO_CODECS.items() if v == label), "hevc")
+        self.cfg["mobile_format"] = "heic" if self.heic_var.get() else "jpg"
+        self.cfg["workers"] = self._int_or(
+            self.workers_var.get(), DEFAULT_CONFIG["workers"], 1, 16)
 
     # --- 実行 ---
     def _validate_paths(self):
@@ -1669,6 +1891,9 @@ class App(tk.Tk):
                 elif kind == "progress":
                     self.progress["value"] = msg[1]
                     self.result_var.set(f"処理中... {msg[1]}/{msg[2]}")
+                elif kind == "video_progress":
+                    self.result_var.set(
+                        f"動画を圧縮中... {msg[1]:.0f}%（{msg[2]}）")
                 elif kind == "log":
                     self._append_log(msg[1])
                 elif kind == "done":

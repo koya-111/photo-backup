@@ -259,6 +259,52 @@ def test_safety(tmp):
     print("  safety: OK")
 
 
+def test_quality(tmp):
+    """C4 並列処理 / C5 HEIC 出力 / C1-C3 の下準備が壊れていないこと。"""
+    # C4: 並列数を上げても結果が同じ
+    intake = os.path.join(tmp, "par_intake")
+    for i in range(6):
+        make_image(os.path.join(intake, f"p{i}.jpg"), 70 + i)
+    cfg = dict(pb.DEFAULT_CONFIG, intake_dir=intake,
+               original_dir=os.path.join(tmp, "par_orig"),
+               mobile_dir=os.path.join(tmp, "par_mob"),
+               work_dir=os.path.join(tmp, "par_work"),
+               workers=4, delete_after_process=False)
+    pb.run_processing(dict(cfg), queue.Queue())
+    orig = [f for _, _, fs in os.walk(cfg["original_dir"]) for f in fs]
+    mob = [f for _, _, fs in os.walk(cfg["mobile_dir"]) for f in fs]
+    assert len(orig) == 6 and len(mob) == 6, (len(orig), len(mob))
+
+    # C5: HEIC 入力は HEIC のまま出力できる
+    if pb.HEIF_AVAILABLE:
+        from PIL import Image as PILImage
+        src_dir = os.path.join(tmp, "heic_intake")
+        os.makedirs(src_dir, exist_ok=True)
+        img = PILImage.new("RGB", (1200, 900), (90, 140, 200))
+        img.save(os.path.join(src_dir, "h.heic"), "HEIF", quality=90)
+
+        hcfg = dict(pb.DEFAULT_CONFIG, intake_dir=src_dir,
+                    original_dir=os.path.join(tmp, "heic_orig"),
+                    mobile_dir=os.path.join(tmp, "heic_mob"),
+                    work_dir=os.path.join(tmp, "heic_work"),
+                    mobile_format="heic", delete_after_process=False)
+        pb.run_processing(dict(hcfg), queue.Queue())
+        outs = [f for _, _, fs in os.walk(hcfg["mobile_dir"]) for f in fs]
+        assert outs == ["h.heic"], f"HEIC で出力されていない: {outs}"
+
+        # jpg 設定なら従来どおり JPEG
+        hcfg["mobile_format"] = "jpg"
+        hcfg["mobile_dir"] = os.path.join(tmp, "heic_mob2")
+        pb.run_processing(dict(hcfg), queue.Queue())
+        outs = [f for _, _, fs in os.walk(hcfg["mobile_dir"]) for f in fs]
+        assert outs == ["h.jpg"], f"JPEG で出力されていない: {outs}"
+
+    # 動画の付加情報は、対象が無くても例外を出さない
+    info = pb.probe_streams(os.path.join(tmp, "no_such.mp4"), "ffmpeg")
+    assert info["duration"] is None and info["audio"] is None, info
+    print("  quality: OK")
+
+
 def test_cancel(tmp):
     """中止要求を出すと、残りのファイルを処理せずに止まる。"""
     import threading
@@ -474,6 +520,7 @@ def main():
         test_delete_defaults(tmp)
         test_safety(tmp)
         test_ops(tmp)
+        test_quality(tmp)
         test_cancel(tmp)
         test_dedup_switch(tmp)
         test_name_dedup(tmp)
