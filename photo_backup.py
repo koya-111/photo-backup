@@ -117,6 +117,7 @@ DEFAULT_CONFIG = {
     "delete_after_process": False,             # 処理後に取り込みフォルダから削除するか(既定は残す)
     "delete_duplicates": False,                # 重複スキップしたファイルも取り込みから削除するか
     "compress_video": False,                   # 動画も圧縮するか
+    "enable_dedup": False,                     # 重複スキップを行うか(既定はオフ)
     "phash_threshold": 5,                      # pHash ハミング距離のしきい値(これ以下で重複扱い)
     "image_long_side": 1200,                   # スマホ戻し用画像の長辺ピクセル
     "jpeg_quality": 80,                        # JPEG 品質(1〜100)
@@ -368,7 +369,9 @@ def process_image(src, cfg, hash_store, stats):
         # pHash は向き適用後の画像から算出(向きの違いで別物扱いされないように)
         ph = imagehash.phash(oriented.convert("RGB"), hash_size=8)
 
-    if hash_store.is_duplicate(ph, cfg["phash_threshold"]):
+    # 重複スキップは既定でオフ。オンのときだけ判定する。
+    # オフでもハッシュは記録しておき、後から有効にしたときに活かせるようにする。
+    if cfg.get("enable_dedup", False) and hash_store.is_duplicate(ph, cfg["phash_threshold"]):
         return "duplicate"
 
     # 1) 元画像を Original へコピー
@@ -665,6 +668,10 @@ def run_processing(cfg, q):
     total = len(files)
     q.put(("start", total))
     log("INFO", f"処理開始: {total} 件 ({intake})")
+    if cfg.get("enable_dedup", False):
+        log("INFO", f"重複スキップ: 有効（pHash 距離 {cfg['phash_threshold']} 以下で重複）")
+    else:
+        log("INFO", "重複スキップ: 無効")
 
     hash_store = HashStore(hash_db_path(cfg))
     stats = {"images": 0, "videos": 0, "orig_bytes": 0, "new_bytes": 0}
@@ -792,12 +799,19 @@ class App(tk.Tk):
             f_set, state="readonly", width=24, values=list(LAYOUT_LABELS.values()))
         self.layout_combo.grid(row=0, column=1, sticky="w", padx=6, pady=2)
 
-        ttk.Label(f_set, text="pHash しきい値(小さいほど厳密):").grid(
-            row=1, column=0, sticky="w", padx=6)
+        # 重複スキップ(オン/オフ + 判定しきい値)
+        f_dedup = ttk.Frame(f_set)
+        f_dedup.grid(row=1, column=0, columnspan=2, sticky="w", padx=6, pady=2)
+        self.dedup_var = tk.BooleanVar(value=False)
+        self.dedup_check = ttk.Checkbutton(
+            f_dedup, text="重複スキップを有効にする", variable=self.dedup_var,
+            command=self._toggle_dedup)
+        self.dedup_check.pack(side="left")
+        ttk.Label(f_dedup, text="　判定の pHash 閾値(小さいほど厳密):").pack(side="left")
         self.threshold_var = tk.StringVar(value="5")
-        ttk.Spinbox(f_set, from_=0, to=20, width=5,
-                    textvariable=self.threshold_var).grid(
-            row=1, column=1, sticky="w", padx=6, pady=2)
+        self.threshold_spin = ttk.Spinbox(
+            f_dedup, from_=0, to=20, width=5, textvariable=self.threshold_var)
+        self.threshold_spin.pack(side="left", padx=4)
 
         self.delete_var = tk.BooleanVar(value=False)
         self.subdir_var = tk.BooleanVar(value=True)
@@ -874,6 +888,14 @@ class App(tk.Tk):
         if d:
             var.set(os.path.normpath(d))
 
+    def _toggle_dedup(self):
+        """重複スキップがオフのときは、しきい値の入力欄を操作できないようにする。"""
+        state = "normal" if self.dedup_var.get() else "disabled"
+        try:
+            self.threshold_spin.config(state=state)
+        except Exception:
+            pass
+
     def _apply_preset(self, _event=None):
         values = COMPRESSION_PRESETS.get(self.preset_combo.get())
         if not values:
@@ -911,7 +933,9 @@ class App(tk.Tk):
         self.delete_var.set(bool(self.cfg["delete_after_process"]))
         self.subdir_var.set(bool(self.cfg.get("include_subfolders", True)))
         self.video_var.set(bool(self.cfg["compress_video"]))
+        self.dedup_var.set(bool(self.cfg.get("enable_dedup", False)))
         self.threshold_var.set(str(self.cfg["phash_threshold"]))
+        self._toggle_dedup()
         self.long_side_var.set(str(self.cfg["image_long_side"]))
         self.quality_var.set(str(self.cfg["jpeg_quality"]))
         self.crf_var.set(str(self.cfg["video_crf"]))
@@ -934,6 +958,7 @@ class App(tk.Tk):
         self.cfg["delete_after_process"] = bool(self.delete_var.get())
         self.cfg["include_subfolders"] = bool(self.subdir_var.get())
         self.cfg["compress_video"] = bool(self.video_var.get())
+        self.cfg["enable_dedup"] = bool(self.dedup_var.get())
         self.cfg["phash_threshold"] = self._int_or(
             self.threshold_var.get(), DEFAULT_CONFIG["phash_threshold"], 0, 20)
         self.cfg["image_long_side"] = self._int_or(

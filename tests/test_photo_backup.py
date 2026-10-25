@@ -145,7 +145,8 @@ def test_end_to_end(tmp):
 
     cfg = dict(pb.DEFAULT_CONFIG, intake_dir=intake,
                original_dir=orig, mobile_dir=mob, work_dir=work,
-               include_subfolders=True, delete_after_process=True)
+               include_subfolders=True, delete_after_process=True,
+               enable_dedup=True)
     q = queue.Queue()
     pb.run_processing(cfg, q)
 
@@ -207,7 +208,7 @@ def test_delete_defaults(tmp):
                original_dir=os.path.join(tmp, "del_orig"),
                mobile_dir=os.path.join(tmp, "del_mob"),
                work_dir=os.path.join(tmp, "del_work"),
-               delete_after_process=True)
+               delete_after_process=True, enable_dedup=True)
     pb.run_processing(cfg, queue.Queue())
     left = sorted(os.listdir(intake))
     assert left == ["x_copy.jpg"], f"重複が削除された: {left}"
@@ -217,6 +218,43 @@ def test_delete_defaults(tmp):
     pb.run_processing(cfg, queue.Queue())
     assert os.listdir(intake) == [], "delete_duplicates=True で重複が残った"
     print("  delete defaults: OK")
+
+
+def test_dedup_switch(tmp):
+    """重複スキップは既定オフ。オンのときだけ重複をスキップする。"""
+    assert pb.DEFAULT_CONFIG["enable_dedup"] is False, "重複スキップの既定がオンになっている"
+
+    intake = os.path.join(tmp, "dedup_intake")
+    make_image(os.path.join(intake, "d.jpg"), 21)
+    shutil.copy2(os.path.join(intake, "d.jpg"), os.path.join(intake, "d_copy.jpg"))
+
+    base = dict(pb.DEFAULT_CONFIG, intake_dir=intake,
+                original_dir=os.path.join(tmp, "dedup_orig"),
+                mobile_dir=os.path.join(tmp, "dedup_mob"),
+                work_dir=os.path.join(tmp, "dedup_work"))
+
+    # オフ(既定): 同じ画像でも 2 枚とも処理される
+    q = queue.Queue()
+    pb.run_processing(dict(base), q)
+    msgs = []
+    while not q.empty():
+        msgs.append(q.get())
+    summary = [m for m in msgs if m[0] == "done"][0][2]
+    assert "画像 2 枚" in summary, f"重複スキップがオフなのにスキップされた: {summary}"
+    assert "重複スキップ 0 件" in summary, summary
+    assert any("重複スキップ: 無効" in m[1] for m in msgs if m[0] == "log"), "無効の記録が無い"
+
+    # オン: 2 枚目がスキップされる（履歴の影響を避けるため DB は新しい場所を使う）
+    cfg = dict(base, work_dir=os.path.join(tmp, "dedup_work2"), enable_dedup=True)
+    q = queue.Queue()
+    pb.run_processing(cfg, q)
+    msgs = []
+    while not q.empty():
+        msgs.append(q.get())
+    summary = [m for m in msgs if m[0] == "done"][0][2]
+    assert "重複スキップ 1 件" in summary, f"重複スキップが効いていない: {summary}"
+    assert any("重複スキップ: 有効" in m[1] for m in msgs if m[0] == "log"), "有効の記録が無い"
+    print("  dedup switch: OK")
 
 
 def test_compression_settings(tmp):
@@ -251,6 +289,7 @@ def main():
         test_end_to_end(tmp)
         test_compression_settings(tmp)
         test_delete_defaults(tmp)
+        test_dedup_switch(tmp)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
     print("すべて成功")
