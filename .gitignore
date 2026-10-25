@@ -7,6 +7,11 @@ venv/
 
 # 実行時に生成されるファイル(環境ごとに異なるため共有しない)
 config.json
+config_profiles.json
+processed.json
+hashes.json
+backup_log*.txt
+Duplicates/
 *.log
 
 # 秘密情報(誤コミット防止)

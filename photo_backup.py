@@ -30,9 +30,10 @@ import re
 import shutil
 import subprocess
 import threading
+import time
 import tkinter as tk
 from datetime import datetime
-from tkinter import filedialog, messagebox, scrolledtext, ttk
+from tkinter import filedialog, messagebox, scrolledtext, simpledialog, ttk
 
 # ---------------------------------------------------------------- 依存ライブラリ
 # 不足していても import 時点では落とさず、起動時にまとめて案内する。
@@ -299,10 +300,18 @@ def delete_file(path, use_recycle_bin=True):
 
 
 def free_space_gb(path):
-    """保存先を含むドライブの空き容量(GB)。取得できなければ None。"""
+    """保存先を含むドライブの空き容量(GB)。取得できなければ None。
+
+    まだ存在しないフォルダでも、存在する親から判定する(下見で作成しないため)。
+    """
+    p = os.path.abspath(path)
+    while p and not os.path.exists(p):
+        parent = os.path.dirname(p)
+        if parent == p:
+            return None
+        p = parent
     try:
-        os.makedirs(path, exist_ok=True)
-        return shutil.disk_usage(path).free / (1024 ** 3)
+        return shutil.disk_usage(p).free / (1024 ** 3)
     except OSError:
         return None
 
@@ -382,6 +391,72 @@ def handle_duplicate(path, cfg, label, log):
             return True
     log("INFO", f"重複スキップ（{label}・取り込みに残します）: {name}")
     return True
+
+
+# ---------------------------------------------------------------- 事前確認・ログ・プロファイル
+def rotate_log(cfg, max_bytes=5 * 1024 * 1024):
+    """ログが大きくなったら日付入りの名前で退避する。"""
+    p = log_path(cfg)
+    try:
+        if os.path.exists(p) and os.path.getsize(p) > max_bytes:
+            stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+            os.replace(p, os.path.join(work_dir(cfg), f"backup_log.{stamp}.txt"))
+            return True
+    except OSError:
+        pass
+    return False
+
+
+def analyze_intake(cfg):
+    """実行前の下見。ファイルの書き込みやフォルダ作成は行わない。"""
+    files = collect_intake_files(cfg)
+    images = [f for f in files if os.path.splitext(f)[1].lower() in IMAGE_EXTS]
+    videos = [f for f in files if os.path.splitext(f)[1].lower() in VIDEO_EXTS]
+    total = 0
+    for f in files:
+        try:
+            total += os.path.getsize(f)
+        except OSError:
+            continue
+    names = collect_existing_names(cfg)
+    ledger = Ledger(ledger_path(cfg))
+    name_hits = sum(1 for f in files
+                    if os.path.splitext(os.path.basename(f))[0].lower() in names)
+    ledger_hits = sum(1 for f in files if ledger.has(f))
+    return {
+        "total": len(files),
+        "images": len(images),
+        "videos": len(videos),
+        "bytes": total,
+        "name_hits": name_hits,
+        "ledger_hits": ledger_hits,
+        "free_original": free_space_gb(original_dir(cfg)),
+        "free_mobile": free_space_gb(mobile_dir(cfg)),
+    }
+
+
+def profiles_path():
+    return os.path.join(SCRIPT_DIR, "config_profiles.json")
+
+
+def load_profiles():
+    try:
+        with open(profiles_path(), "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            return {k: v for k, v in data.items() if isinstance(v, dict)}
+    except Exception:
+        pass
+    return {}
+
+
+def save_profiles(profiles):
+    try:
+        with open(profiles_path(), "w", encoding="utf-8") as f:
+            json.dump(profiles, f, ensure_ascii=False, indent=2)
+        return True
+    except Exception:
+        return False
 
 
 # ---------------------------------------------------------------- pHash の保存・照合
@@ -476,7 +551,8 @@ class HashStore:
 DEDUP_MODES = {
     "phash": "pHash（見た目）",
     "name": "ファイル名",
-    "both": "両方",
+    "ledger": "処理済み記録",
+    "both": "すべて",
 }
 
 
@@ -496,13 +572,77 @@ def collect_existing_names(cfg):
     return names
 
 
+def ledger_path(cfg):
+    return os.path.join(work_dir(cfg), "processed.json")
+
+
+class Ledger:
+    """処理済みファイルの台帳。
+
+    「名前 + サイズ + 更新日時」を鍵にするので、同じ名前でも中身が違えば
+    別ファイルとして扱える(連番がリセットされた別カメラの同名写真など)。
+    """
+
+    def __init__(self, path):
+        self.path = path
+        self._entries = {}
+        self._load()
+
+    def _load(self):
+        try:
+            with open(self.path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict) and isinstance(data.get("entries"), dict):
+                self._entries = data["entries"]
+        except Exception:
+            self._entries = {}
+
+    @staticmethod
+    def key_for(path):
+        st = os.stat(path)
+        return f"{os.path.basename(path).lower()}|{st.st_size}|{int(st.st_mtime)}"
+
+    def has(self, path):
+        try:
+            return self.key_for(path) in self._entries
+        except OSError:
+            return False
+
+    def add(self, path):
+        try:
+            st = os.stat(path)
+            self._entries[self.key_for(path)] = {
+                "name": os.path.basename(path),
+                "size": st.st_size,
+                "mtime": int(st.st_mtime),
+                "path": path,
+            }
+        except OSError:
+            pass
+
+    def __len__(self):
+        return len(self._entries)
+
+    def save(self):
+        try:
+            d = os.path.dirname(self.path)
+            if d:
+                os.makedirs(d, exist_ok=True)
+            with open(self.path, "w", encoding="utf-8") as f:
+                json.dump({"version": 1, "entries": self._entries},
+                          f, ensure_ascii=False)
+        except Exception:
+            pass
+
+
 class DuplicateChecker:
-    """pHash とファイル名の 2 通りで重複を判定する。
+    """pHash・ファイル名・処理済み台帳の 3 通りで重複を判定する。
 
     mode:
-        "phash" … pHash のハミング距離だけで判定
-        "name"  … 出力済みと同じファイル名なら重複
-        "both"  … どちらかに該当したら重複
+        "phash"  … pHash のハミング距離だけで判定
+        "name"   … 出力済みと同じファイル名なら重複
+        "ledger" … 同じファイルを処理済みなら重複(名前+サイズ+更新日時)
+        "both"   … 3 つすべてで判定
     """
 
     def __init__(self, cfg, log=None):
@@ -513,35 +653,43 @@ class DuplicateChecker:
         self.threshold = cfg.get("phash_threshold", 5)
         self.use_phash = self.enabled and self.mode in ("phash", "both")
         self.use_name = self.enabled and self.mode in ("name", "both")
+        self.use_ledger = self.enabled and self.mode in ("ledger", "both")
         self.store = HashStore(hash_db_path(cfg))
+        self.ledger = Ledger(ledger_path(cfg))
         self.names = set()
         if self.use_name:
             self.names = collect_existing_names(cfg)
             if log:
                 log("INFO", f"重複判定(ファイル名): 出力済み {len(self.names)} 件の名前を読み込みました")
+        if self.use_ledger and log:
+            log("INFO", f"重複判定(処理済み台帳): {len(self.ledger)} 件を読み込みました")
 
     @staticmethod
     def _stem(path):
         return os.path.splitext(os.path.basename(path))[0].lower()
 
     def check(self, ph, src):
-        """重複なら理由("name" / "phash")を、そうでなければ None を返す。"""
+        """重複なら理由("name"/"ledger"/"phash")を、そうでなければ None を返す。"""
         if not self.enabled:
             return None
         if self.use_name and self._stem(src) in self.names:
             return "name"
+        if self.use_ledger and self.ledger.has(src):
+            return "ledger"
         if self.use_phash and self.store.is_duplicate(ph, self.threshold):
             return "phash"
         return None
 
     def accept(self, ph, src):
-        """処理したファイルを記録する(重複判定がオフでも pHash は残す)。"""
+        """処理したファイルを記録する(重複判定がオフでも履歴は残す)。"""
         self.store.add(ph)
+        self.ledger.add(src)
         if self.use_name:
             self.names.add(self._stem(src))
 
     def save(self):
         self.store.save()
+        self.ledger.save()
 
 
 # ---------------------------------------------------------------- 撮影日時の取得
@@ -876,6 +1024,7 @@ def remove_empty_subdirs(intake):
 def run_processing(cfg, q, cancel_event=None):
     log_file = log_path(cfg)
     cancelled = False
+    rotate_log(cfg)
 
     def log(level, msg):
         emit_log(q, log_file, level, msg)
@@ -923,6 +1072,8 @@ def run_processing(cfg, q, cancel_event=None):
             detail.append(f"pHash 距離 {checker.threshold} 以下")
         if checker.use_name:
             detail.append("ファイル名が一致")
+        if checker.use_ledger:
+            detail.append("処理済みのファイル")
         log("INFO", f"重複スキップ: 有効（{DEDUP_MODES[checker.mode]} / "
                     + " または ".join(detail) + "）")
     else:
@@ -950,7 +1101,9 @@ def run_processing(cfg, q, cancel_event=None):
                     reason = result.split(":", 1)[1] if ":" in result else "phash"
                     if reason == "name":
                         skipped_name += 1
-                    label = "同名ファイルあり" if reason == "name" else "類似画像"
+                    label = {"name": "同名ファイルあり",
+                             "ledger": "処理済み",
+                             "phash": "類似画像"}.get(reason, "類似画像")
                     dup_handled = True
                     keep_in_intake = handle_duplicate(p, cfg, label, log)
                 else:
@@ -1012,9 +1165,13 @@ class App(tk.Tk):
         self.queue = queue.Queue()
         self.running = False
         self.cancel_event = threading.Event()
+        self.profiles = load_profiles()
+        self._watch_signature = None
+        self._last_watch_check = 0.0
         self._build_ui()
         self._load_cfg_to_ui()
         self.after(100, self._poll_queue)
+        self.after(2000, self._watch_tick)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
         if not HEIF_AVAILABLE:
@@ -1058,6 +1215,20 @@ class App(tk.Tk):
             ttk.Button(f_dest, text="参照...", width=8,
                        command=lambda v=var, t=title: self._browse(v, t)).grid(
                 row=i, column=2, padx=(0, 6), pady=2)
+
+        # 設定プロファイル
+        f_prof = ttk.Frame(f_dest)
+        f_prof.grid(row=3, column=0, columnspan=3, sticky="w", padx=6, pady=(4, 2))
+        ttk.Label(f_prof, text="プロファイル:").pack(side="left")
+        self.profile_combo = ttk.Combobox(f_prof, state="readonly", width=24)
+        self.profile_combo.pack(side="left", padx=4)
+        self.profile_combo.bind("<<ComboboxSelected>>", self._apply_profile)
+        self.profile_save_btn = ttk.Button(
+            f_prof, text="保存...", width=8, command=self._save_profile)
+        self.profile_save_btn.pack(side="left", padx=(8, 0))
+        self.profile_del_btn = ttk.Button(
+            f_prof, text="削除", width=6, command=self._delete_profile)
+        self.profile_del_btn.pack(side="left", padx=4)
 
         # 整理・動作
         f_set = ttk.LabelFrame(self, text="整理と動作")
@@ -1109,6 +1280,22 @@ class App(tk.Tk):
                         variable=self.video_var).grid(
             row=5, column=0, columnspan=2, sticky="w", padx=6)
 
+        # フォルダ監視
+        f_watch = ttk.Frame(f_set)
+        f_watch.grid(row=6, column=0, columnspan=2, sticky="w", padx=6, pady=(2, 4))
+        self.watch_var = tk.BooleanVar(value=False)
+        self.watch_check = ttk.Checkbutton(
+            f_watch, text="取り込みフォルダを監視して自動実行",
+            variable=self.watch_var, command=self._toggle_watch)
+        self.watch_check.pack(side="left")
+        ttk.Label(f_watch, text="　間隔:").pack(side="left")
+        self.watch_interval_var = tk.StringVar(value="60")
+        self.watch_spin = ttk.Spinbox(
+            f_watch, from_=10, to=3600, increment=10, width=6, state="disabled",
+            textvariable=self.watch_interval_var)
+        self.watch_spin.pack(side="left", padx=4)
+        ttk.Label(f_watch, text="秒").pack(side="left")
+
         # 圧縮の程度
         f_comp = ttk.LabelFrame(self, text="圧縮の程度")
         f_comp.grid(row=3, column=0, sticky="ew", **pad)
@@ -1144,8 +1331,11 @@ class App(tk.Tk):
         # 実行
         f_run = ttk.Frame(self)
         f_run.grid(row=4, column=0, sticky="ew", **pad)
-        self.run_btn = ttk.Button(f_run, text="実行", command=self._start)
-        self.run_btn.pack(side="left")
+        self.preview_btn = ttk.Button(f_run, text="事前確認", width=10,
+                                      command=self._preview)
+        self.preview_btn.pack(side="left")
+        self.run_btn = ttk.Button(f_run, text="実行", width=8, command=self._start)
+        self.run_btn.pack(side="left", padx=(6, 0))
         self.cancel_btn = ttk.Button(f_run, text="中止", width=8,
                                      command=self._cancel, state="disabled")
         self.cancel_btn.pack(side="left", padx=(6, 0))
@@ -1173,6 +1363,130 @@ class App(tk.Tk):
         d = filedialog.askdirectory(initialdir=initial, title=title)
         if d:
             var.set(os.path.normpath(d))
+
+    # --- 事前確認 ---
+    def _preview(self):
+        if self.running:
+            return
+        self._save_ui_to_cfg()
+        if not os.path.isdir(self.cfg["intake_dir"]):
+            messagebox.showerror(
+                "設定を確認してください",
+                f"取り込みフォルダが見つかりません:\n{self.cfg['intake_dir']}")
+            return
+        try:
+            info = analyze_intake(self.cfg)
+        except Exception as e:
+            messagebox.showerror("事前確認に失敗しました", str(e))
+            return
+
+        total_mb = info["bytes"] / (1024 * 1024)
+        free_o = info["free_original"]
+        free_m = info["free_mobile"]
+        lines = [
+            f"対象: {info['total']} 件（画像 {info['images']} / 動画 {info['videos']}）",
+            f"合計サイズ: {total_mb:,.1f} MB",
+            "",
+            f"同名でスキップ見込み: {info['name_hits']} 件",
+            f"処理済みでスキップ見込み: {info['ledger_hits']} 件",
+        ]
+        if info["videos"] and not check_ffmpeg(self.cfg["ffmpeg_path"]):
+            lines.append("※ FFmpeg が見つからないため、動画は処理されません")
+        lines.append("")
+        if free_o is not None:
+            lines.append(f"Original の空き: {free_o:,.1f} GB"
+                         f"（必要目安 {total_mb / 1024:,.1f} GB）")
+        if free_m is not None:
+            lines.append(f"Mobile の空き: {free_m:,.1f} GB"
+                         f"（必要目安 {total_mb / 1024 / 2:,.1f} GB）")
+        lines += [
+            "",
+            "※ pHash での重複判定と圧縮後の容量は、実行するまで確定しません。",
+        ]
+        self._append_log("事前確認: " + " / ".join(
+            x for x in lines[:2] if x))
+        messagebox.showinfo("事前確認（書き込みは行いません）", "\n".join(lines))
+
+    # --- フォルダ監視 ---
+    def _toggle_watch(self):
+        if self.watch_var.get():
+            self._watch_signature = None
+            self._last_watch_check = 0.0
+            self.watch_spin.config(state="normal")
+            self._append_log("取り込みフォルダの監視を開始しました。")
+        else:
+            self.watch_spin.config(state="disabled")
+            self._append_log("取り込みフォルダの監視を停止しました。")
+
+    def _watch_tick(self):
+        try:
+            if self.watch_var.get() and not self.running:
+                interval = self._int_or(self.watch_interval_var.get(), 60, 10, 3600)
+                now = time.time()
+                if now - self._last_watch_check >= interval:
+                    self._last_watch_check = now
+                    cfg = dict(self.cfg)
+                    cfg["intake_dir"] = normalize_dir(
+                        self.intake_var.get(), DEFAULT_CONFIG["intake_dir"])
+                    if os.path.isdir(cfg["intake_dir"]):
+                        files = collect_intake_files(cfg)
+                        signature = (len(files), max((f for f in files), default=""))
+                        if files and signature != self._watch_signature:
+                            self._watch_signature = signature
+                            self._append_log(
+                                f"監視: {len(files)} 件を検出したため処理を開始します。")
+                            self._start()
+        except Exception as e:
+            self._append_log(f"監視中にエラー: {e}")
+        self.after(5000, self._watch_tick)
+
+    # --- プロファイル ---
+    def _refresh_profiles(self):
+        names = sorted(self.profiles)
+        self.profile_combo.config(values=names)
+        if self.profile_combo.get() not in names:
+            self.profile_combo.set("")
+
+    def _apply_profile(self, _event=None):
+        name = self.profile_combo.get()
+        data = self.profiles.get(name)
+        if not data:
+            return
+        self._save_ui_to_cfg()          # 今の画面を保存してから切り替える
+        cfg = dict(DEFAULT_CONFIG)
+        cfg.update({k: v for k, v in data.items() if k in DEFAULT_CONFIG})
+        for key in ("intake_dir", "original_dir", "mobile_dir", "work_dir"):
+            cfg[key] = normalize_dir(cfg.get(key), DEFAULT_CONFIG[key])
+        self.cfg = cfg
+        self._load_cfg_to_ui()
+        self._append_log(f"プロファイル「{name}」を読み込みました。")
+
+    def _save_profile(self):
+        default = self.profile_combo.get() or "新しいプロファイル"
+        name = simpledialog.askstring("プロファイルの保存", "名前を入力してください:",
+                                      initialvalue=default, parent=self)
+        if not name:
+            return
+        self._save_ui_to_cfg()
+        self.profiles[name.strip()] = {
+            k: self.cfg[k] for k in DEFAULT_CONFIG if k in self.cfg}
+        if save_profiles(self.profiles):
+            self._refresh_profiles()
+            self.profile_combo.set(name.strip())
+            self._append_log(f"プロファイル「{name.strip()}」を保存しました。")
+        else:
+            messagebox.showerror("エラー", "プロファイルを保存できませんでした。")
+
+    def _delete_profile(self):
+        name = self.profile_combo.get()
+        if not name or name not in self.profiles:
+            return
+        if not messagebox.askyesno("確認", f"プロファイル「{name}」を削除しますか？"):
+            return
+        del self.profiles[name]
+        save_profiles(self.profiles)
+        self._refresh_profiles()
+        self._append_log(f"プロファイル「{name}」を削除しました。")
 
     def _on_dedup_mode(self, _event=None):
         self._toggle_dedup()
@@ -1257,6 +1571,8 @@ class App(tk.Tk):
                    self.cfg["video_crf"])
         preset = next((n for n, v in COMPRESSION_PRESETS.items() if v == current), "カスタム")
         self.preset_combo.set(preset)
+        self._refresh_profiles()
+        self._toggle_dedup()
 
     def _save_ui_to_cfg(self):
         self.cfg["intake_dir"] = normalize_dir(

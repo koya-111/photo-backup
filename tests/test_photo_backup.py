@@ -344,6 +344,65 @@ def test_name_dedup(tmp):
     print("  name dedup: OK")
 
 
+def test_ops(tmp):
+    """B1 事前確認 / B2 台帳 / B4 ログローテーション / B5 プロファイル。"""
+    intake = os.path.join(tmp, "ops_intake")
+    make_image(os.path.join(intake, "o.jpg"), 61)
+    work = os.path.join(tmp, "ops_work")
+    cfg = dict(pb.DEFAULT_CONFIG, intake_dir=intake,
+               original_dir=os.path.join(tmp, "ops_orig"),
+               mobile_dir=os.path.join(tmp, "ops_mob"),
+               work_dir=work)
+
+    # B1: 事前確認はフォルダを作らず、件数を返す
+    info = pb.analyze_intake(cfg)
+    assert info["total"] == 1 and info["images"] == 1, info
+    assert not os.path.exists(cfg["original_dir"]), "事前確認でフォルダが作られた"
+
+    # 処理して台帳に載る
+    pb.run_processing(dict(cfg), queue.Queue())
+    assert os.path.exists(os.path.join(work, "processed.json")), "台帳が作られていない"
+
+    # B2: 台帳方式は「同じファイル」を重複として弾く
+    cfg_ledger = dict(cfg, enable_dedup=True, dedup_mode="ledger")
+    q = queue.Queue()
+    pb.run_processing(dict(cfg_ledger), q)
+    msgs = []
+    while not q.empty():
+        msgs.append(q.get())
+    assert "重複スキップ 1 件" in [m for m in msgs if m[0] == "done"][0][2], "台帳で弾けていない"
+
+    # 中身もサイズも変えれば、同名でも処理される（名前方式との違い）
+    os.remove(os.path.join(intake, "o.jpg"))
+    make_image(os.path.join(intake, "o.jpg"), 62, size=(1200, 900))
+    q = queue.Queue()
+    pb.run_processing(dict(cfg_ledger), q)
+    msgs = []
+    while not q.empty():
+        msgs.append(q.get())
+    assert "画像 1 枚" in [m for m in msgs if m[0] == "done"][0][2], "同名の別ファイルまで弾いた"
+
+    # B4: 大きくなったログは退避される
+    log = os.path.join(work, "backup_log.txt")
+    with open(log, "w", encoding="utf-8") as f:
+        f.write("x" * (6 * 1024 * 1024))
+    assert pb.rotate_log(cfg), "ログがローテーションされない"
+    assert not os.path.exists(log), "元のログが残っている"
+    assert [n for n in os.listdir(work) if n.startswith("backup_log.")], "退避ファイルが無い"
+
+    # B5: プロファイルの保存と読み込み
+    old = pb.SCRIPT_DIR
+    pb.SCRIPT_DIR = os.path.join(tmp, "ops_script")
+    os.makedirs(pb.SCRIPT_DIR, exist_ok=True)
+    try:
+        assert pb.load_profiles() == {}, "初期状態でプロファイルがある"
+        assert pb.save_profiles({"A": {"jpeg_quality": 70}}), "保存に失敗"
+        assert pb.load_profiles()["A"]["jpeg_quality"] == 70, "読み込みに失敗"
+    finally:
+        pb.SCRIPT_DIR = old
+    print("  ops: OK")
+
+
 def test_dedup_switch(tmp):
     """重複スキップは既定オフ。オンのときだけ重複をスキップする。"""
     assert pb.DEFAULT_CONFIG["enable_dedup"] is False, "重複スキップの既定がオンになっている"
@@ -414,6 +473,7 @@ def main():
         test_compression_settings(tmp)
         test_delete_defaults(tmp)
         test_safety(tmp)
+        test_ops(tmp)
         test_cancel(tmp)
         test_dedup_switch(tmp)
         test_name_dedup(tmp)
