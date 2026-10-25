@@ -263,6 +263,48 @@ def test_cancel(tmp):
     print("  cancel: OK")
 
 
+def test_name_dedup(tmp):
+    """ファイル名方式の重複判定。中身が違っても同名ならスキップする。"""
+    intake = os.path.join(tmp, "name_intake")
+    cfg = dict(pb.DEFAULT_CONFIG, intake_dir=intake,
+               original_dir=os.path.join(tmp, "name_orig"),
+               mobile_dir=os.path.join(tmp, "name_mob"),
+               work_dir=os.path.join(tmp, "name_work"),
+               enable_dedup=True, dedup_mode="name")
+
+    make_image(os.path.join(intake, "IMG_0001.jpg"), 41)
+    q = queue.Queue()
+    pb.run_processing(dict(cfg), q)
+    msgs = []
+    while not q.empty():
+        msgs.append(q.get())
+    assert "画像 1 枚" in [m for m in msgs if m[0] == "done"][0][2], "1回目が処理されていない"
+
+    # 中身を差し替えても、同名なら「重複」としてスキップされる
+    os.remove(os.path.join(intake, "IMG_0001.jpg"))
+    make_image(os.path.join(intake, "IMG_0001.jpg"), 42)
+    q = queue.Queue()
+    pb.run_processing(dict(cfg), q)
+    msgs = []
+    while not q.empty():
+        msgs.append(q.get())
+    summary = [m for m in msgs if m[0] == "done"][0][2]
+    assert "画像 0 枚" in summary, f"同名なのに処理された: {summary}"
+    assert "うち同名 1 件" in summary, f"同名判定の記録が無い: {summary}"
+    assert any("同名ファイルあり" in m[1] for m in msgs if m[0] == "log"), "理由の記録が無い"
+
+    # 名前が違えば、中身が同じでも「ファイル名方式」ではスキップしない
+    os.remove(os.path.join(intake, "IMG_0001.jpg"))
+    make_image(os.path.join(intake, "IMG_0002.jpg"), 42)
+    q = queue.Queue()
+    pb.run_processing(dict(cfg), q)
+    msgs = []
+    while not q.empty():
+        msgs.append(q.get())
+    assert "画像 1 枚" in [m for m in msgs if m[0] == "done"][0][2], "別名なのにスキップされた"
+    print("  name dedup: OK")
+
+
 def test_dedup_switch(tmp):
     """重複スキップは既定オフ。オンのときだけ重複をスキップする。"""
     assert pb.DEFAULT_CONFIG["enable_dedup"] is False, "重複スキップの既定がオンになっている"
@@ -334,6 +376,7 @@ def main():
         test_delete_defaults(tmp)
         test_cancel(tmp)
         test_dedup_switch(tmp)
+        test_name_dedup(tmp)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
     print("すべて成功")

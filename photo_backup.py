@@ -118,6 +118,7 @@ DEFAULT_CONFIG = {
     "delete_duplicates": False,                # 重複スキップしたファイルも取り込みから削除するか
     "compress_video": False,                   # 動画も圧縮するか
     "enable_dedup": False,                     # 重複スキップを行うか(既定はオフ)
+    "dedup_mode": "phash",                     # 判定方法: phash / name / both
     "phash_threshold": 5,                      # pHash ハミング距離のしきい値(これ以下で重複扱い)
     "image_long_side": 1200,                   # スマホ戻し用画像の長辺ピクセル
     "jpeg_quality": 80,                        # JPEG 品質(1〜100)
@@ -338,6 +339,78 @@ class HashStore:
             pass
 
 
+# ---------------------------------------------------------------- 重複判定
+DEDUP_MODES = {
+    "phash": "pHash（見た目）",
+    "name": "ファイル名",
+    "both": "両方",
+}
+
+
+def collect_existing_names(cfg):
+    """出力済みファイルの名前(拡張子を除く・小文字)を集める。
+
+    ファイル名での重複判定に使う。保存先を走査するので、
+    台帳ファイルを持たなくても既存の出力から復元できる。
+    """
+    names = set()
+    for base in (original_dir(cfg), mobile_dir(cfg)):
+        if not os.path.isdir(base):
+            continue
+        for _root, _dirs, files in os.walk(base):
+            for name in files:
+                names.add(os.path.splitext(name)[0].lower())
+    return names
+
+
+class DuplicateChecker:
+    """pHash とファイル名の 2 通りで重複を判定する。
+
+    mode:
+        "phash" … pHash のハミング距離だけで判定
+        "name"  … 出力済みと同じファイル名なら重複
+        "both"  … どちらかに該当したら重複
+    """
+
+    def __init__(self, cfg, log=None):
+        self.enabled = bool(cfg.get("enable_dedup", False))
+        self.mode = cfg.get("dedup_mode", "phash")
+        if self.mode not in DEDUP_MODES:
+            self.mode = "phash"
+        self.threshold = cfg.get("phash_threshold", 5)
+        self.use_phash = self.enabled and self.mode in ("phash", "both")
+        self.use_name = self.enabled and self.mode in ("name", "both")
+        self.store = HashStore(hash_db_path(cfg))
+        self.names = set()
+        if self.use_name:
+            self.names = collect_existing_names(cfg)
+            if log:
+                log("INFO", f"重複判定(ファイル名): 出力済み {len(self.names)} 件の名前を読み込みました")
+
+    @staticmethod
+    def _stem(path):
+        return os.path.splitext(os.path.basename(path))[0].lower()
+
+    def check(self, ph, src):
+        """重複なら理由("name" / "phash")を、そうでなければ None を返す。"""
+        if not self.enabled:
+            return None
+        if self.use_name and self._stem(src) in self.names:
+            return "name"
+        if self.use_phash and self.store.is_duplicate(ph, self.threshold):
+            return "phash"
+        return None
+
+    def accept(self, ph, src):
+        """処理したファイルを記録する(重複判定がオフでも pHash は残す)。"""
+        self.store.add(ph)
+        if self.use_name:
+            self.names.add(self._stem(src))
+
+    def save(self):
+        self.store.save()
+
+
 # ---------------------------------------------------------------- 撮影日時の取得
 def get_photo_datetime(im, src):
     try:
@@ -351,7 +424,7 @@ def get_photo_datetime(im, src):
 
 
 # ---------------------------------------------------------------- 画像処理
-def process_image(src, cfg, hash_store, stats):
+def process_image(src, cfg, checker, stats):
     with Image.open(src) as im:
         im.load()
         exif = im.getexif()
@@ -371,8 +444,9 @@ def process_image(src, cfg, hash_store, stats):
 
     # 重複スキップは既定でオフ。オンのときだけ判定する。
     # オフでもハッシュは記録しておき、後から有効にしたときに活かせるようにする。
-    if cfg.get("enable_dedup", False) and hash_store.is_duplicate(ph, cfg["phash_threshold"]):
-        return "duplicate"
+    reason = checker.check(ph, src)
+    if reason:
+        return f"duplicate:{reason}"
 
     # 1) 元画像を Original へコピー
     dest_orig_dir = os.path.join(original_dir(cfg), layout_subfolder(dt, cfg["layout"]))
@@ -414,7 +488,7 @@ def process_image(src, cfg, hash_store, stats):
         save_kwargs["icc_profile"] = icc  # 色プロファイルを保持
     img.save(dest_mobile, "JPEG", **save_kwargs)
 
-    hash_store.add(ph)
+    checker.accept(ph, src)
 
     stats["images"] += 1
     stats["orig_bytes"] += os.path.getsize(src)
@@ -707,14 +781,22 @@ def run_processing(cfg, q, cancel_event=None):
     total = len(files)
     q.put(("start", total))
     log("INFO", f"処理開始: {total} 件 ({intake})")
-    if cfg.get("enable_dedup", False):
-        log("INFO", f"重複スキップ: 有効（pHash 距離 {cfg['phash_threshold']} 以下で重複）")
+
+    checker = DuplicateChecker(cfg, log)
+    if checker.enabled:
+        detail = []
+        if checker.use_phash:
+            detail.append(f"pHash 距離 {checker.threshold} 以下")
+        if checker.use_name:
+            detail.append("ファイル名が一致")
+        log("INFO", f"重複スキップ: 有効（{DEDUP_MODES[checker.mode]} / "
+                    + " または ".join(detail) + "）")
     else:
         log("INFO", "重複スキップ: 無効")
 
-    hash_store = HashStore(hash_db_path(cfg))
     stats = {"images": 0, "videos": 0, "orig_bytes": 0, "new_bytes": 0}
     skipped_dup = 0
+    skipped_name = 0
     errors = 0
 
     for i, p in enumerate(files, 1):
@@ -727,16 +809,20 @@ def run_processing(cfg, q, cancel_event=None):
         keep_in_intake = False
         try:
             if ext in IMAGE_EXTS:
-                result = process_image(p, cfg, hash_store, stats)
-                if result == "duplicate":
+                result = process_image(p, cfg, checker, stats)
+                if result.startswith("duplicate"):
                     skipped_dup += 1
+                    reason = result.split(":", 1)[1] if ":" in result else "phash"
+                    if reason == "name":
+                        skipped_name += 1
+                    label = "同名ファイルあり" if reason == "name" else "類似画像"
                     # 重複と判定したファイルは原本も Mobile も作られていない。
                     # 誤判定だった場合に取り返しがつかないため、既定では残す。
                     if not cfg.get("delete_duplicates", False):
                         keep_in_intake = True
-                        log("INFO", f"重複スキップ（取り込みに残します）: {name}")
+                        log("INFO", f"重複スキップ（{label}・取り込みに残します）: {name}")
                     else:
-                        log("INFO", f"重複スキップ: {name}")
+                        log("INFO", f"重複スキップ（{label}）: {name}")
                 else:
                     log("INFO", f"画像処理: {name}")
             else:
@@ -760,7 +846,7 @@ def run_processing(cfg, q, cancel_event=None):
 
         q.put(("progress", i, total))
 
-    hash_store.save()
+    checker.save()
 
     # サブフォルダを取り込み元ごと整理した場合、空になったフォルダを片付ける
     if cfg.get("include_subfolders", True) and cfg["delete_after_process"] and not cancelled:
@@ -773,9 +859,12 @@ def run_processing(cfg, q, cancel_event=None):
     reduction = (1 - stats["new_bytes"] / stats["orig_bytes"]) * 100 \
         if stats["orig_bytes"] > 0 else 0.0
 
+    dup_detail = f"重複スキップ {skipped_dup} 件"
+    if skipped_name:
+        dup_detail += f"（うち同名 {skipped_name} 件）"
     summary = (
         f"画像 {stats['images']} 枚 / 動画 {stats['videos']} 件 を処理"
-        f"（重複スキップ {skipped_dup} 件 / エラー {errors} 件）\n"
+        f"（{dup_detail} / エラー {errors} 件）\n"
         f"元 {orig_mb:.1f} MB → {new_mb:.1f} MB（{reduction:.1f}% 削減）"
     )
     if cancelled:
@@ -849,7 +938,7 @@ class App(tk.Tk):
             f_set, state="readonly", width=24, values=list(LAYOUT_LABELS.values()))
         self.layout_combo.grid(row=0, column=1, sticky="w", padx=6, pady=2)
 
-        # 重複スキップ(オン/オフ + 判定しきい値)
+        # 重複スキップ(オン/オフ + 判定方法 + pHash しきい値)
         f_dedup = ttk.Frame(f_set)
         f_dedup.grid(row=1, column=0, columnspan=2, sticky="w", padx=6, pady=2)
         self.dedup_var = tk.BooleanVar(value=False)
@@ -857,7 +946,12 @@ class App(tk.Tk):
             f_dedup, text="重複スキップを有効にする", variable=self.dedup_var,
             command=self._toggle_dedup)
         self.dedup_check.pack(side="left")
-        ttk.Label(f_dedup, text="　判定の pHash 閾値(小さいほど厳密):").pack(side="left")
+        ttk.Label(f_dedup, text="　方式:").pack(side="left")
+        self.dedup_mode_combo = ttk.Combobox(
+            f_dedup, state="readonly", width=13, values=list(DEDUP_MODES.values()))
+        self.dedup_mode_combo.pack(side="left", padx=4)
+        self.dedup_mode_combo.bind("<<ComboboxSelected>>", self._on_dedup_mode)
+        ttk.Label(f_dedup, text="pHash 閾値:").pack(side="left", padx=(10, 0))
         self.threshold_var = tk.StringVar(value="5")
         self.threshold_spin = ttk.Spinbox(
             f_dedup, from_=0, to=20, width=5, textvariable=self.threshold_var)
@@ -941,13 +1035,27 @@ class App(tk.Tk):
         if d:
             var.set(os.path.normpath(d))
 
+    def _on_dedup_mode(self, _event=None):
+        self._toggle_dedup()
+
     def _toggle_dedup(self):
-        """重複スキップがオフのときは、しきい値の入力欄を操作できないようにする。"""
-        state = "normal" if self.dedup_var.get() else "disabled"
+        """重複スキップがオフのときは、方式としきい値を操作できないようにする。"""
+        enabled = self.dedup_var.get()
+        mode = self._dedup_mode_key()
         try:
-            self.threshold_spin.config(state=state)
+            self.dedup_mode_combo.config(state="readonly" if enabled else "disabled")
+            # ファイル名方式では pHash のしきい値を使わない
+            spin_state = "normal" if (enabled and mode in ("phash", "both")) else "disabled"
+            self.threshold_spin.config(state=spin_state)
         except Exception:
             pass
+
+    def _dedup_mode_key(self):
+        label = self.dedup_mode_combo.get()
+        for key, text in DEDUP_MODES.items():
+            if text == label:
+                return key
+        return "phash"
 
     def _apply_preset(self, _event=None):
         values = COMPRESSION_PRESETS.get(self.preset_combo.get())
@@ -987,6 +1095,8 @@ class App(tk.Tk):
         self.subdir_var.set(bool(self.cfg.get("include_subfolders", True)))
         self.video_var.set(bool(self.cfg["compress_video"]))
         self.dedup_var.set(bool(self.cfg.get("enable_dedup", False)))
+        mode = self.cfg.get("dedup_mode", "phash")
+        self.dedup_mode_combo.set(DEDUP_MODES.get(mode, DEDUP_MODES["phash"]))
         self.threshold_var.set(str(self.cfg["phash_threshold"]))
         self._toggle_dedup()
         self.long_side_var.set(str(self.cfg["image_long_side"]))
@@ -1012,6 +1122,7 @@ class App(tk.Tk):
         self.cfg["include_subfolders"] = bool(self.subdir_var.get())
         self.cfg["compress_video"] = bool(self.video_var.get())
         self.cfg["enable_dedup"] = bool(self.dedup_var.get())
+        self.cfg["dedup_mode"] = self._dedup_mode_key()
         self.cfg["phash_threshold"] = self._int_or(
             self.threshold_var.get(), DEFAULT_CONFIG["phash_threshold"], 0, 20)
         self.cfg["image_long_side"] = self._int_or(
