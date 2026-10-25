@@ -220,6 +220,49 @@ def test_delete_defaults(tmp):
     print("  delete defaults: OK")
 
 
+def test_cancel(tmp):
+    """中止要求を出すと、残りのファイルを処理せずに止まる。"""
+    import threading
+
+    intake = os.path.join(tmp, "cancel_intake")
+    for i in range(3):
+        make_image(os.path.join(intake, f"c{i}.jpg"), 30 + i)
+    before = sorted(os.listdir(intake))
+
+    cfg = dict(pb.DEFAULT_CONFIG, intake_dir=intake,
+               original_dir=os.path.join(tmp, "cancel_orig"),
+               mobile_dir=os.path.join(tmp, "cancel_mob"),
+               work_dir=os.path.join(tmp, "cancel_work"))
+
+    # 開始前に中止要求を立てておく
+    event = threading.Event()
+    event.set()
+    q = queue.Queue()
+    pb.run_processing(cfg, q, event)
+
+    msgs = []
+    while not q.empty():
+        msgs.append(q.get())
+    done = [m for m in msgs if m[0] == "done"][0]
+    summary = done[2]
+    assert "中止しました" in summary, f"中止の表示が無い: {summary}"
+    assert done[3] is True, "中止フラグが立っていない"
+    assert "画像 0 枚" in summary, f"中止なのに処理された: {summary}"
+
+    # 取り込み元は一切変更されない
+    assert sorted(os.listdir(intake)) == before, "中止したのにファイルが動いた"
+    assert any("中止要求" in m[1] for m in msgs if m[0] == "log"), "中止ログが無い"
+
+    # 中止していない通常実行では中止フラグが False
+    q = queue.Queue()
+    pb.run_processing(dict(cfg), q, threading.Event())
+    msgs = []
+    while not q.empty():
+        msgs.append(q.get())
+    assert [m for m in msgs if m[0] == "done"][0][3] is False, "通常実行で中止扱いになった"
+    print("  cancel: OK")
+
+
 def test_dedup_switch(tmp):
     """重複スキップは既定オフ。オンのときだけ重複をスキップする。"""
     assert pb.DEFAULT_CONFIG["enable_dedup"] is False, "重複スキップの既定がオンになっている"
@@ -289,6 +332,7 @@ def main():
         test_end_to_end(tmp)
         test_compression_settings(tmp)
         test_delete_defaults(tmp)
+        test_cancel(tmp)
         test_dedup_switch(tmp)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)

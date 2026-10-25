@@ -501,9 +501,16 @@ def get_video_datetime(src, ffmpeg_path=None):
     return datetime.fromtimestamp(os.path.getmtime(src))
 
 
+class Cancelled(Exception):
+    """ユーザーが中止を要求したときに送出する。"""
+
+
 # ---------------------------------------------------------------- 動画処理
-def process_video(src, cfg, stats):
+def process_video(src, cfg, stats, cancel_event=None):
     dt = get_video_datetime(src, cfg.get("ffmpeg_path"))
+
+    if cancel_event is not None and cancel_event.is_set():
+        raise Cancelled()
 
     # 元動画を Original へコピー
     dest_orig_dir = os.path.join(original_dir(cfg), layout_subfolder(dt, cfg["layout"]))
@@ -526,17 +533,45 @@ def process_video(src, cfg, stats):
         "-tag:v", "hvc1",
         "-c:a", "aac", "-b:a", "128k",
         "-movflags", "+faststart",
+        "-nostats", "-loglevel", "error",
         dest_mobile,
     ]
-    proc = subprocess.run(cmd, capture_output=True, text=True)
+    # 中止要求にすぐ反応できるよう、完了を待たずに一定間隔で状態を見る
+    proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL,
+                            stderr=subprocess.PIPE, text=True)
+    try:
+        while True:
+            try:
+                _, err = proc.communicate(timeout=0.5)
+                break
+            except subprocess.TimeoutExpired:
+                if cancel_event is not None and cancel_event.is_set():
+                    proc.kill()
+                    proc.communicate()
+                    raise Cancelled()
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.communicate()
+
     if proc.returncode != 0:
-        tail = (proc.stderr or "").strip()[-500:]
+        if cancel_event is not None and cancel_event.is_set():
+            _remove_quietly(dest_mobile)
+            raise Cancelled()
+        tail = (err or "").strip()[-500:]
         raise RuntimeError(f"FFmpeg が失敗: {tail}")
 
     stats["videos"] += 1
     stats["orig_bytes"] += os.path.getsize(src)
     stats["new_bytes"] += os.path.getsize(dest_mobile)
     return "ok"
+
+
+def _remove_quietly(path):
+    try:
+        os.remove(path)
+    except OSError:
+        pass
 
 
 def check_ffmpeg(ffmpeg_path):
@@ -631,11 +666,15 @@ def remove_empty_subdirs(intake):
 
 
 # ---------------------------------------------------------------- 処理本体(別スレッドで実行)
-def run_processing(cfg, q):
+def run_processing(cfg, q, cancel_event=None):
     log_file = log_path(cfg)
+    cancelled = False
 
     def log(level, msg):
         emit_log(q, log_file, level, msg)
+
+    def is_cancelled():
+        return cancel_event is not None and cancel_event.is_set()
 
     for d in (original_dir(cfg), mobile_dir(cfg), work_dir(cfg)):
         try:
@@ -679,6 +718,10 @@ def run_processing(cfg, q):
     errors = 0
 
     for i, p in enumerate(files, 1):
+        if is_cancelled():
+            cancelled = True
+            log("WARN", "中止要求を受け付けたため、残りのファイルを処理せず停止しました。")
+            break
         name = os.path.basename(p)
         ext = os.path.splitext(name)[1].lower()
         keep_in_intake = False
@@ -697,7 +740,7 @@ def run_processing(cfg, q):
                 else:
                     log("INFO", f"画像処理: {name}")
             else:
-                process_video(p, cfg, stats)
+                process_video(p, cfg, stats, cancel_event)
                 log("INFO", f"動画圧縮: {name}")
 
             # 成功したら、設定に応じて取り込み元から削除
@@ -707,6 +750,10 @@ def run_processing(cfg, q):
                     log("INFO", f"取り込みから削除: {name}")
                 except OSError as e:
                     log("WARN", f"削除に失敗: {name} ({e})")
+        except Cancelled:
+            cancelled = True
+            log("WARN", f"中止により処理を中断しました: {name}")
+            break
         except Exception as e:
             errors += 1
             log("ERROR", f"処理失敗: {name} ({e})")
@@ -716,7 +763,7 @@ def run_processing(cfg, q):
     hash_store.save()
 
     # サブフォルダを取り込み元ごと整理した場合、空になったフォルダを片付ける
-    if cfg.get("include_subfolders", True) and cfg["delete_after_process"]:
+    if cfg.get("include_subfolders", True) and cfg["delete_after_process"] and not cancelled:
         removed_dirs = remove_empty_subdirs(intake)
         if removed_dirs:
             log("INFO", f"空フォルダを削除: {removed_dirs} 件")
@@ -731,8 +778,10 @@ def run_processing(cfg, q):
         f"（重複スキップ {skipped_dup} 件 / エラー {errors} 件）\n"
         f"元 {orig_mb:.1f} MB → {new_mb:.1f} MB（{reduction:.1f}% 削減）"
     )
+    if cancelled:
+        summary = "中止しました（ここまでの結果）\n" + summary
     log("INFO", summary.replace("\n", " / "))
-    q.put(("done", stats, summary))
+    q.put(("done", stats, summary, cancelled))
 
 
 # ---------------------------------------------------------------- GUI
@@ -743,6 +792,7 @@ class App(tk.Tk):
         self.cfg = load_config()
         self.queue = queue.Queue()
         self.running = False
+        self.cancel_event = threading.Event()
         self._build_ui()
         self._load_cfg_to_ui()
         self.after(100, self._poll_queue)
@@ -863,6 +913,9 @@ class App(tk.Tk):
         f_run.grid(row=4, column=0, sticky="ew", **pad)
         self.run_btn = ttk.Button(f_run, text="実行", command=self._start)
         self.run_btn.pack(side="left")
+        self.cancel_btn = ttk.Button(f_run, text="中止", width=8,
+                                     command=self._cancel, state="disabled")
+        self.cancel_btn.pack(side="left", padx=(6, 0))
         self.progress = ttk.Progressbar(f_run, mode="determinate")
         self.progress.pack(side="left", fill="x", expand=True, padx=8)
 
@@ -1001,7 +1054,9 @@ class App(tk.Tk):
             return
 
         self.running = True
+        self.cancel_event.clear()
         self.run_btn.config(state="disabled")
+        self.cancel_btn.config(state="normal")
         self.progress["value"] = 0
         self.result_var.set("処理中...")
         self.log_text.config(state="normal")
@@ -1009,8 +1064,18 @@ class App(tk.Tk):
         self.log_text.config(state="disabled")
 
         t = threading.Thread(target=run_processing,
-                             args=(self.cfg, self.queue), daemon=True)
+                             args=(self.cfg, self.queue, self.cancel_event),
+                             daemon=True)
         t.start()
+
+    # --- 中止 ---
+    def _cancel(self):
+        if not self.running:
+            return
+        self.cancel_event.set()
+        self.cancel_btn.config(state="disabled")
+        self.result_var.set("中止しています...（実行中のファイルが終わり次第停止します）")
+        self._append_log("中止を要求しました。")
 
     # --- queue を監視して UI を更新 ---
     def _poll_queue(self):
@@ -1030,14 +1095,20 @@ class App(tk.Tk):
                     self.result_var.set(msg[2])
                     self.running = False
                     self.run_btn.config(state="normal")
+                    self.cancel_btn.config(state="disabled")
+                    self.cancel_event.clear()
         except queue.Empty:
             pass
         self.after(100, self._poll_queue)
 
     def _on_close(self):
         if self.running:
-            if not messagebox.askyesno("確認", "処理中です。終了してもよろしいですか？"):
+            if not messagebox.askyesno(
+                    "確認", "処理中です。中止して終了してもよろしいですか？"):
                 return
+            self.cancel_event.set()
+            self.after(300, self.destroy)
+            return
         self._save_ui_to_cfg()
         save_config(self.cfg)
         self.destroy()
