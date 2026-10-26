@@ -453,24 +453,38 @@ def profiles_path():
     return os.path.join(SCRIPT_DIR, "config_profiles.json")
 
 
-def load_profiles():
+def load_profile_store():
+    """(プロファイル辞書, 最後に使った名前) を返す。旧形式にも対応。"""
     try:
         with open(profiles_path(), "r", encoding="utf-8") as f:
             data = json.load(f)
-        if isinstance(data, dict):
-            return {k: v for k, v in data.items() if isinstance(v, dict)}
     except Exception:
-        pass
-    return {}
+        return {}, ""
+    if not isinstance(data, dict):
+        return {}, ""
+    if isinstance(data.get("profiles"), dict):
+        profiles = {k: v for k, v in data["profiles"].items() if isinstance(v, dict)}
+        return profiles, str(data.get("last") or "")
+    # 旧形式: {"名前": {設定}}
+    return {k: v for k, v in data.items() if isinstance(v, dict)}, ""
 
 
-def save_profiles(profiles):
+def save_profile_store(profiles, last=""):
     try:
         with open(profiles_path(), "w", encoding="utf-8") as f:
-            json.dump(profiles, f, ensure_ascii=False, indent=2)
+            json.dump({"version": 2, "last": last, "profiles": profiles},
+                      f, ensure_ascii=False, indent=2)
         return True
     except Exception:
         return False
+
+
+def load_profiles():
+    return load_profile_store()[0]
+
+
+def save_profiles(profiles):
+    return save_profile_store(profiles, "")
 
 
 # ---------------------------------------------------------------- pHash の保存・照合
@@ -1205,6 +1219,23 @@ def check_writable_dirs(cfg):
     return problems
 
 
+def suggest_writable_base():
+    """書き込める保存先の候補を順に試して、最初に見つかったものを返す。"""
+    candidates = [
+        os.path.join(os.path.expanduser("~"), "PhotoBackup"),
+        os.path.join(os.environ.get("LOCALAPPDATA", ""), "PhotoBackup"),
+        os.path.join(SCRIPT_DIR, "PhotoBackup"),
+        r"C:\PhotoBackup",
+    ]
+    for path in candidates:
+        if not path or path.startswith("PhotoBackup"):
+            continue
+        ok, _err = is_writable_dir(path)
+        if ok:
+            return os.path.normpath(path)
+    return None
+
+
 def is_running_as_admin():
     """管理者権限で動いているか。"""
     try:
@@ -1212,6 +1243,33 @@ def is_running_as_admin():
         return bool(ctypes.windll.shell32.IsUserAnAdmin())
     except Exception:
         return False
+
+
+def _run_capture(cmd, timeout=20):
+    """外部コマンドの標準出力を文字列で返す(失敗時は空文字)。"""
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True,
+                              timeout=timeout, errors="replace")
+        return proc.stdout or ""
+    except Exception:
+        return ""
+
+
+def token_summary():
+    """プロセスのトークン情報(整合性レベル・管理者グループの状態)を抜き出す。"""
+    text = _run_capture(["whoami", "/groups"])
+    picked = []
+    for line in text.splitlines():
+        if ("Mandatory Label" in line or "Integrity" in line
+                or "Administrators" in line or "Admin" in line):
+            picked.append(" ".join(line.split()))
+    return picked
+
+
+def folder_acl(path):
+    """フォルダの ACL(icacls)を行ごとに返す。"""
+    text = _run_capture(["icacls", path])
+    return [" ".join(line.split()) for line in text.splitlines() if line.strip()][:6]
 
 
 def diagnose_environment(cfg):
@@ -1233,6 +1291,9 @@ def diagnose_environment(cfg):
         ok, err = is_writable_dir(path)
         results.append((label, path, ok, err))
 
+    ng_paths = [p for _l, p, ok, _e in results if not ok]
+    acls = {p: folder_acl(p) for p in ng_paths[:3]}
+
     dsh_vars = sorted(k for k in os.environ if k.startswith("DSH_"))
     return {
         "user": os.environ.get("USERNAME", ""),
@@ -1244,6 +1305,8 @@ def diagnose_environment(cfg):
         "dsh_vars": dsh_vars,
         "temp_env": os.environ.get("TEMP", ""),
         "temp_used": tempfile.gettempdir(),
+        "token": token_summary(),
+        "acls": acls,
     }
 
 
@@ -1290,6 +1353,14 @@ def format_diagnostics(info):
         if err:
             line += f"  ({err})"
         lines.append(line)
+
+    if info.get("token"):
+        lines += ["", "トークン情報:"]
+        lines += [f"  {t}" for t in info["token"]]
+    for path, acl in (info.get("acls") or {}).items():
+        lines += ["", f"ACL: {path}"]
+        lines += [f"  {a}" for a in acl]
+
     hint = restricted_environment_hint(info)
     if hint:
         lines += ["", "推定原因:", hint]
@@ -1580,11 +1651,13 @@ class App(tk.Tk):
         self.queue = queue.Queue()
         self.running = False
         self.cancel_event = threading.Event()
-        self.profiles = load_profiles()
+        self.profiles, self._last_profile = load_profile_store()
+        self._active_profile = ""
         self._watch_signature = None
         self._last_watch_check = 0.0
         self._build_ui()
         self._load_cfg_to_ui()
+        self._restore_last_profile()
         self.after(100, self._poll_queue)
         self.after(2000, self._watch_tick)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -1644,6 +1717,10 @@ class App(tk.Tk):
         self.profile_del_btn = ttk.Button(
             f_prof, text="削除", width=6, command=self._delete_profile)
         self.profile_del_btn.pack(side="left", padx=4)
+        self.suggest_btn = ttk.Button(
+            f_prof, text="推奨フォルダを設定", width=18,
+            command=self._apply_suggested_base)
+        self.suggest_btn.pack(side="left", padx=(16, 0))
 
         # 整理・動作
         f_set = ttk.LabelFrame(self, text="整理と動作")
@@ -1898,7 +1975,14 @@ class App(tk.Tk):
             return
         text = format_diagnostics(info)
         self._append_log("診断: " + text.replace("\n", " / "))
-        messagebox.showinfo("環境診断（書き込みテスト）", text)
+        try:
+            self.clipboard_clear()
+            self.clipboard_append(text)
+            self.update()
+            note = "\n\n※ この内容はクリップボードにコピーしました。"
+        except Exception:
+            note = ""
+        messagebox.showinfo("環境診断（書き込みテスト）", text + note)
 
     # --- フォルダ監視 ---
     def _toggle_watch(self):
@@ -1934,24 +2018,73 @@ class App(tk.Tk):
         self.after(5000, self._watch_tick)
 
     # --- プロファイル ---
+    def _apply_suggested_base(self):
+        base = suggest_writable_base()
+        if not base:
+            messagebox.showerror(
+                "見つかりません",
+                "書き込めるフォルダを自動で見つけられませんでした。\n"
+                "エクスプローラーでフォルダを作成し、「参照...」から指定してください。")
+            return
+        if not messagebox.askyesno(
+                "保存先の変更",
+                f"保存先を次の場所に変更しますか？\n\n{base}\\Original\n"
+                f"{base}\\Mobile\n{base}（ログ・重複DB）"):
+            return
+        self.original_var.set(os.path.join(base, "Original"))
+        self.mobile_var.set(os.path.join(base, "Mobile"))
+        self.work_var.set(base)
+        self._append_log(f"保存先を {base} に設定しました。")
+
     def _refresh_profiles(self):
         names = sorted(self.profiles)
         self.profile_combo.config(values=names)
         if self.profile_combo.get() not in names:
             self.profile_combo.set("")
 
-    def _apply_profile(self, _event=None):
-        name = self.profile_combo.get()
-        data = self.profiles.get(name)
-        if not data:
+    def _profile_payload(self):
+        return {k: self.cfg[k] for k in DEFAULT_CONFIG if k in self.cfg}
+
+    def _remember_current_profile(self):
+        """選択中のプロファイルへ、今の画面設定を書き戻す。"""
+        name = self._active_profile
+        if not name or name not in self.profiles:
             return
-        self._save_ui_to_cfg()          # 今の画面を保存してから切り替える
+        self._save_ui_to_cfg()
+        self.profiles[name] = self._profile_payload()
+        save_profile_store(self.profiles, self._last_profile)
+
+    def _restore_last_profile(self):
+        """前回使ったプロファイルを起動時に読み込む。"""
+        name = self._last_profile
+        if not name or name not in self.profiles:
+            return
+        self._apply_profile_data(self.profiles[name])
+        self._active_profile = name
+        self.profile_combo.set(name)
+        self._append_log(f"前回のプロファイル「{name}」を読み込みました。")
+
+    def _apply_profile_data(self, data):
         cfg = dict(DEFAULT_CONFIG)
         cfg.update({k: v for k, v in data.items() if k in DEFAULT_CONFIG})
         for key in ("intake_dir", "original_dir", "mobile_dir", "work_dir"):
             cfg[key] = normalize_dir(cfg.get(key), DEFAULT_CONFIG[key])
         self.cfg = cfg
         self._load_cfg_to_ui()
+
+    def _apply_profile(self, _event=None):
+        name = self.profile_combo.get()
+        if not name or name == self._active_profile:
+            return
+        data = self.profiles.get(name)
+        if not data:
+            return
+        # 切り替える前に、いま編集中の内容を元のプロファイルへ保存する
+        self._remember_current_profile()
+        self._apply_profile_data(data)
+        self._active_profile = name
+        self._last_profile = name
+        save_profile_store(self.profiles, self._last_profile)
         self._append_log(f"プロファイル「{name}」を読み込みました。")
 
     def _save_profile(self):
@@ -1961,16 +2094,19 @@ class App(tk.Tk):
         if not name:
             return
         name = name.strip()
-        if name in self.profiles and not messagebox.askyesno(
-                "確認", f"プロファイル「{name}」を上書きしますか？"):
-            return
+        if name in self.profiles and name != self._active_profile:
+            if not messagebox.askyesno("確認", f"プロファイル「{name}」を上書きしますか？"):
+                return
         self._save_ui_to_cfg()
-        self.profiles[name] = {
-            k: self.cfg[k] for k in DEFAULT_CONFIG if k in self.cfg}
-        if save_profiles(self.profiles):
+        self.profiles[name] = self._profile_payload()
+        self._active_profile = name
+        self._last_profile = name
+        if save_profile_store(self.profiles, self._last_profile):
             self._refresh_profiles()
             self.profile_combo.set(name)
-            self._append_log(f"プロファイル「{name}」を保存しました。")
+            self._append_log(f"プロファイル「{name}」を保存しました"
+                             f"（取り込み: {self.cfg['intake_dir']} / "
+                             f"Original: {self.cfg['original_dir']}）")
         else:
             messagebox.showerror("エラー", "プロファイルを保存できませんでした。")
 
@@ -1981,7 +2117,11 @@ class App(tk.Tk):
         if not messagebox.askyesno("確認", f"プロファイル「{name}」を削除しますか？"):
             return
         del self.profiles[name]
-        save_profiles(self.profiles)
+        if self._active_profile == name:
+            self._active_profile = ""
+        if self._last_profile == name:
+            self._last_profile = ""
+        save_profile_store(self.profiles, self._last_profile)
         self._refresh_profiles()
         self._append_log(f"プロファイル「{name}」を削除しました。")
 
@@ -2148,6 +2288,7 @@ class App(tk.Tk):
             return
         self._save_ui_to_cfg()
         save_config(self.cfg)
+        self._remember_current_profile()
 
         error = self._validate_paths()
         if error:

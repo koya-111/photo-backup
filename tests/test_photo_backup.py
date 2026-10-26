@@ -360,6 +360,29 @@ def test_diagnostics(tmp):
     print("  diagnostics: OK")
 
 
+def test_profile_store(tmp):
+    """プロファイルの保存形式（last と旧形式の互換）。"""
+    old = pb.SCRIPT_DIR
+    pb.SCRIPT_DIR = tmp
+    try:
+        assert pb.save_profile_store(
+            {"A": {"intake_dir": "D:/in", "original_dir": "D:/orig"}}, "A")
+        profiles, last = pb.load_profile_store()
+        assert profiles["A"]["intake_dir"] == "D:/in", profiles
+        assert profiles["A"]["original_dir"] == "D:/orig", profiles
+        assert last == "A", last
+
+        # 旧形式（名前→設定のフラット辞書）も読める
+        with open(pb.profiles_path(), "w", encoding="utf-8") as f:
+            json.dump({"B": {"intake_dir": "E:/in"}}, f)
+        profiles, last = pb.load_profile_store()
+        assert profiles["B"]["intake_dir"] == "E:/in", profiles
+        assert last == "", last
+    finally:
+        pb.SCRIPT_DIR = old
+    print("  profile store: OK")
+
+
 def test_cancel(tmp):
     """中止要求を出すと、残りのファイルを処理せずに止まる。"""
     import threading
@@ -578,6 +601,7 @@ def main():
         test_quality(tmp)
         test_timezone(tmp)
         test_diagnostics(tmp)
+        test_profile_store(tmp)
         test_cancel(tmp)
         test_dedup_switch(tmp)
         test_name_dedup(tmp)
