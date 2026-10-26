@@ -1313,6 +1313,13 @@ def diagnose_environment(cfg):
 def restricted_environment_hint(info):
     """制限された環境から起動している疑いがあるときのヒントを返す。"""
     ok_map = {label: ok for label, _p, ok, _e in info["results"]}
+    tokens = " ".join(info.get("token", []))
+    if ("Low Mandatory" in tokens or "S-1-16-4096" in tokens
+            or "低 Mandatory" in tokens):
+        return ("Low 整合性レベル（Low Mandatory Level）で動作しています。"
+                "この状態では、通常のユーザーフォルダ（デスクトップ・TEMP など）へ"
+                "書き込めません。アプリのフォルダごとワークスペースの外"
+                "（例: C:\\PhotoBackup\\app）へコピーしてから起動してください。")
     if info.get("dsh_vars"):
         return ("エージェント（DSH）経由で起動されています。この場合、"
                 "セッションのフォルダ以外への書き込みが制限されます。"
