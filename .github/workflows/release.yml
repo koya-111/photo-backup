@@ -1,0 +1,114 @@
+# exe をビルドして GitHub Releases に添付するワークフロー
+#
+#   v1.0.0 のようなタグを push すると、自動でビルド → リリース作成まで行います。
+#       git tag v1.0.0
+#       git push origin v1.0.0
+#   Actions 画面から手動実行（workflow_dispatch）する場合はタグ名を指定してください。
+#   タグが無ければ、その時点のコミットにタグを作ってリリースします。
+#
+#   成果物: PhotoBackup_win64.zip（フォルダ配布版）と SHA256SUMS.txt
+
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "リリースするタグ（例: v1.0.0）"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+env:
+  # 日本語のログが文字化けしないようにする
+  PYTHONIOENCODING: utf-8
+  PYTHONUTF8: "1"
+
+jobs:
+  build:
+    runs-on: windows-latest
+    env:
+      TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+    steps:
+      - name: リポジトリを取得
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Python を準備
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements-lock.txt
+
+      - name: 依存関係をインストール
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-lock.txt
+
+      - name: スモークテスト
+        run: python tests/test_photo_backup.py
+
+      - name: タグを確認
+        shell: pwsh
+        run: |
+          $tag = $env:TAG
+          if ($tag -notmatch '^v\d+\.\d+\.\d+') {
+            throw "タグ名は v1.0.0 の形式にしてください（指定値: $tag）"
+          }
+          $exists = git rev-parse --verify "refs/tags/$tag" 2>$null
+          if ($LASTEXITCODE -eq 0) {
+            Write-Host "既存のタグを使います: $tag"
+          } elseif ("$env:GITHUB_EVENT_NAME" -eq "workflow_dispatch") {
+            git tag $tag
+            git push origin "refs/tags/$tag"
+            Write-Host "タグを作成しました: $tag"
+          } else {
+            throw "タグが見つかりません: $tag"
+          }
+
+      - name: exe をビルド
+        run: python -m PyInstaller --noconfirm --clean photo_backup.spec
+
+      - name: 配布用 zip と SHA256 を作成
+        shell: pwsh
+        run: |
+          $exe = "dist\PhotoBackup\PhotoBackup.exe"
+          if (-not (Test-Path $exe)) { throw "ビルド成果物が見つかりません: $exe" }
+          if (Test-Path "dist\PhotoBackup\config.json") { throw "配布物に config.json が混ざっています" }
+
+          Compress-Archive -Path "dist\PhotoBackup" `
+            -DestinationPath "dist\PhotoBackup_win64.zip" -CompressionLevel Optimal -Force
+
+          $zip = Get-Item "dist\PhotoBackup_win64.zip"
+          $hash = (Get-FileHash $zip.FullName -Algorithm SHA256).Hash.ToLower()
+          "$hash  PhotoBackup_win64.zip" | Set-Content -Path "dist\SHA256SUMS.txt" -Encoding utf8
+
+          $summary = "PhotoBackup_win64.zip: {0:N1} MB / SHA256: ``$hash``" -f ($zip.Length / 1MB)
+          Write-Host $summary
+          $summary | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+
+      - name: リリースを作成して添付
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $tag = $env:TAG
+          $assets = @("dist\PhotoBackup_win64.zip", "dist\SHA256SUMS.txt")
+
+          gh release view $tag 2>$null | Out-Null
+          if ($LASTEXITCODE -eq 0) {
+            Write-Host "既存のリリースにアセットを差し替えます: $tag"
+            gh release upload $tag @assets --clobber
+          } else {
+            gh release create $tag @assets --title "PhotoBackup $tag" --generate-notes
+          }
+          if ($LASTEXITCODE -ne 0) { throw "リリースの作成に失敗しました" }
+
+          gh release view $tag --json url,assets --jq '.url, (.assets[].name)'

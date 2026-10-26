@@ -1,0 +1,14 @@
+# リリース用 exe をビルドしたときの依存バージョン（再現用）
+#   CI（.github/workflows/release.yml）と、ローカルで同じ exe を作り直すときに使う
+#   pip install -r requirements-lock.txt
+#
+# 通常の利用（ソースから起動）では requirements.txt を使ってください。
+# バージョンを更新するときは、実際にビルド・起動確認したうえでこのファイルも更新します。
+
+Pillow==12.2.0
+pillow-heif==1.8.1
+ImageHash==4.3.2
+numpy==2.4.4
+scipy==1.18.1
+PyWavelets==1.10.0
+pyinstaller==6.22.3

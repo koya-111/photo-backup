@@ -2,6 +2,19 @@
 
 Android スマホの写真・動画を PC に高画質でバックアップし、スマホへ戻すための軽量版を自動生成する Windows 向けツールです。スマホの空き容量を確保することを目的としています。
 
+## ダウンロード（exe 版・Python 不要）
+
+**[最新版をダウンロード](https://github.com/koya-111/photo-backup/releases/latest)**（Releases ページの `PhotoBackup_win64.zip`）
+
+1. `PhotoBackup_win64.zip` をダウンロードして展開する
+2. 展開した `PhotoBackup` フォルダを、書き込みできる場所（例 `C:\PhotoBackup\app`）へ**フォルダごと**置く
+3. 中の `PhotoBackup.exe` をダブルクリックする
+
+> - 初回起動時に「Windows によって PC が保護されました」と表示された場合は、**「詳細情報」→「実行」**で起動できます（実行ファイルにコード署名をしていないためです）
+> - `C:\Program Files` 直下など書き込みできない場所に置くと、設定（`config.json`）を保存できません
+> - 動画圧縮を使う場合のみ FFmpeg を別途導入してください（同梱していません。`使い方.md` の 2-3 参照）
+> - ダウンロードしたファイルが改ざんされていないか確認したい場合は、同じリリースに添付している `SHA256SUMS.txt` と照合してください
+
 ## 特徴
 
 - **原本を保全**: 取り込んだファイルは無劣化のまま `Original` へコピー
@@ -18,7 +31,7 @@ Android スマホの写真・動画を PC に高画質でバックアップし�
 ## 動作環境
 
 - Windows 10 / 11
-- Python 3.10 以上
+- exe 版は Python 不要。ソースから動かす場合は Python 3.10 以上
 - FFmpeg（動画圧縮を使う場合のみ。`libx265` を含むビルド）
 
 ## セットアップ
@@ -40,9 +53,11 @@ pip install -r requirements.txt
 | `photo_backup.bat` | 起動用ランチャー（Python を自動検出） |
 | `requirements.txt` | 依存ライブラリ |
 | `requirements-build.txt` | exe 作成用（PyInstaller） |
+| `requirements-lock.txt` | リリース用 exe をビルドしたときの固定バージョン（CI 用） |
 | `photo_backup.spec` | PyInstaller 設定（フォルダ配布版・推奨） |
 | `photo_backup_onefile.spec` | PyInstaller 設定（1 ファイル版） |
 | `build_exe.bat` | exe をビルドするスクリプト |
+| `.github/workflows/release.yml` | タグを push すると exe をビルドして Releases へ添付するワークフロー |
 | `使い方.md` | 詳しい利用手順・設定一覧・トラブルシューティング |
 
 ## exe にする
@@ -61,6 +76,21 @@ pip install -r requirements-build.txt
 - **FFmpeg は同梱されません**。動画圧縮を使う場合は別途導入し、画面の「FFmpeg」欄で `ffmpeg.exe` を指定してください（「自動検出」ボタンあり）
 - ソース版の設定を引き継ぐ場合は、環境変数 `PHOTO_BACKUP_CONFIG` に `config.json` のフルパスを指定します
 - 1 ファイルにまとめたい場合は `photo_backup_onefile.spec` でビルドします。初回起動に数秒かかり、一時フォルダへ書き込めない環境では起動できません
+
+### リリース用の exe を作る（配布）
+
+配布用の zip は GitHub Actions が自動で作ります。`v1.0.0` のようなタグを push すると、ビルド → スモークテスト → `PhotoBackup_win64.zip` と `SHA256SUMS.txt` の添付までが実行されます。
+
+```powershell
+git tag v1.0.0
+git push origin v1.0.0
+```
+
+手元で同じものを作りたい場合は、`requirements-lock.txt` を使ってから `build_exe.bat` を実行し、`dist\PhotoBackup` を zip にまとめてください。
+
+## ライセンス
+
+本体は [MIT License](LICENSE)。同梱しているサードパーティ製ライブラリ（Pillow / pillow-heif / ImageHash / numpy / scipy / PyWavelets / Tkinter など）は、それぞれのライセンスに従います。FFmpeg は同梱していません。
 
 ## 既定のフォルダ
 
