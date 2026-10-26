@@ -3,3 +3,5 @@
 Pillow>=10.0
 pillow-heif>=0.13
 ImageHash>=4.3
+# 削除時にゴミ箱へ移動するため（無い場合は完全削除にフォールバックします）
+Send2Trash>=1.8

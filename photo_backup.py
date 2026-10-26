@@ -116,6 +116,8 @@ def dependency_message():
     return "\n".join(lines).rstrip() if lines else None
 
 APP_NAME = "PhotoBackup"
+APP_VERSION = "1.0.1"
+APP_TITLE = "Android 写真 バックアップ＆軽量化ツール"
 
 # ---------------------------------------------------------------- 設定の既定値
 DEFAULT_CONFIG = {
@@ -1687,7 +1689,7 @@ def run_processing(cfg, q, cancel_event=None):
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("Android 写真 バックアップ＆軽量化ツール")
+        self.title(f"{APP_TITLE} v{APP_VERSION}")
         self.cfg = load_config()
         self.queue = queue.Queue()
         self.running = False

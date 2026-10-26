@@ -19,6 +19,9 @@ hiddenimports = [
     "scipy.fftpack",
     "scipy.special._ufuncs_cxx",
     "pywt",
+    # プラットフォームごとに動的 import されるため明示する（ゴミ箱への移動）
+    "send2trash",
+    "send2trash.win",
 ]
 
 # ネイティブ拡張を含むパッケージは丸ごと集める

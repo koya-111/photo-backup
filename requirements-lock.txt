@@ -8,6 +8,7 @@
 Pillow==12.2.0
 pillow-heif==1.8.1
 ImageHash==4.3.2
+Send2Trash==2.1.0
 numpy==2.4.4
 scipy==1.18.1
 PyWavelets==1.10.0
