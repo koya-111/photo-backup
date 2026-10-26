@@ -58,7 +58,8 @@ pip install -r requirements-build.txt
 - 出力: `dist\PhotoBackup\PhotoBackup.exe`（**フォルダごと**コピーして使います）
 - `config.json` は **exe と同じフォルダ**に作られます。書き込みできない場所（`C:\Program Files` 直下など）に置くと設定を保存できません
 - `config_profiles.json` / `processed.json` も同じ考え方で保存されます
-- **FFmpeg は同梱されません**。動画圧縮を使う場合は別途導入し、`ffmpeg_path` を設定してください
+- **FFmpeg は同梱されません**。動画圧縮を使う場合は別途導入し、画面の「FFmpeg」欄で `ffmpeg.exe` を指定してください（「自動検出」ボタンあり）
+- ソース版の設定を引き継ぐ場合は、環境変数 `PHOTO_BACKUP_CONFIG` に `config.json` のフルパスを指定します
 - 1 ファイルにまとめたい場合は `photo_backup_onefile.spec` でビルドします。初回起動に数秒かかり、一時フォルダへ書き込めない環境では起動できません
 
 ## 既定のフォルダ

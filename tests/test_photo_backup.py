@@ -336,6 +336,30 @@ def test_timezone(tmp):
     print("  timezone: OK")
 
 
+def test_diagnostics(tmp):
+    """FFmpeg 探索と保存先の書き込み確認。"""
+    cfg = dict(pb.DEFAULT_CONFIG,
+               original_dir=os.path.join(tmp, "diag_orig"),
+               mobile_dir=os.path.join(tmp, "diag_mob"),
+               work_dir=os.path.join(tmp, "diag_work"))
+    assert pb.check_writable_dirs(cfg) == [], "書き込めるのに問題ありと判定された"
+
+    # ファイルをディレクトリとして指定すると失敗を検出できる
+    blocker = os.path.join(tmp, "diag_file.txt")
+    with open(blocker, "w", encoding="utf-8") as f:
+        f.write("x")
+    bad = dict(cfg, original_dir=blocker)
+    problems = pb.check_writable_dirs(bad)
+    assert len(problems) == 1 and problems[0][0] == "Original", problems
+
+    # 候補には設定値が先頭で入る
+    cand = pb.ffmpeg_candidates(dict(pb.DEFAULT_CONFIG, ffmpeg_path="C:/test/ffmpeg.exe"))
+    assert cand[0] == "C:/test/ffmpeg.exe", cand
+    assert pb.find_ffmpeg(dict(pb.DEFAULT_CONFIG,
+                               ffmpeg_path="C:/no/such/ffmpeg.exe")) is None
+    print("  diagnostics: OK")
+
+
 def test_cancel(tmp):
     """中止要求を出すと、残りのファイルを処理せずに止まる。"""
     import threading
@@ -553,6 +577,7 @@ def main():
         test_ops(tmp)
         test_quality(tmp)
         test_timezone(tmp)
+        test_diagnostics(tmp)
         test_cancel(tmp)
         test_dedup_switch(tmp)
         test_name_dedup(tmp)

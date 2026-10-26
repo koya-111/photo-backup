@@ -180,6 +180,10 @@ else:
 
 # ---------------------------------------------------------------- 設定の読み書き
 def config_path():
+    """設定ファイルの場所。環境変数 PHOTO_BACKUP_CONFIG で上書きできる。"""
+    override = os.environ.get("PHOTO_BACKUP_CONFIG")
+    if override:
+        return os.path.normpath(override)
     return os.path.join(SCRIPT_DIR, "config.json")
 
 
@@ -1132,6 +1136,67 @@ def check_ffmpeg(ffmpeg_path):
         return False
 
 
+# ---------------------------------------------------------------- FFmpeg の探索
+COMMON_FFMPEG_PATHS = [
+    r"C:\ffmpeg\bin\ffmpeg.exe",
+    r"C:\Program Files\ffmpeg\bin\ffmpeg.exe",
+    r"C:\ProgramData\chocolatey\bin\ffmpeg.exe",
+]
+
+
+def ffmpeg_candidates(cfg):
+    """設定・PATH・同梱フォルダ・よくある導入先から候補を並べる。"""
+    configured = (cfg.get("ffmpeg_path") or "ffmpeg").strip().strip('"')
+    found = [configured]
+    located = shutil.which(configured) if configured else None
+    if located:
+        found.append(located)
+    if not os.path.isabs(configured):
+        found += [
+            os.path.join(SCRIPT_DIR, "ffmpeg.exe"),
+            os.path.join(SCRIPT_DIR, "bin", "ffmpeg.exe"),
+            os.path.join(os.environ.get("LOCALAPPDATA", ""),
+                         "Microsoft", "WinGet", "Links", "ffmpeg.exe"),
+        ]
+        found += COMMON_FFMPEG_PATHS
+    # 重複を除く
+    seen = set()
+    unique = []
+    for c in found:
+        if not c or c.lower() in seen:
+            continue
+        seen.add(c.lower())
+        unique.append(c)
+    return unique
+
+
+def find_ffmpeg(cfg):
+    """実際に起動できる ffmpeg のパスを返す(見つからなければ None)。"""
+    for candidate in ffmpeg_candidates(cfg):
+        if check_ffmpeg(candidate):
+            return candidate
+    return None
+
+
+# ---------------------------------------------------------------- 保存先の書き込み確認
+def check_writable_dirs(cfg):
+    """保存先に書き込めるかを実際に試す。問題があれば [(名前, パス, 例外)] を返す。"""
+    problems = []
+    targets = (("Original", original_dir(cfg)),
+               ("Mobile", mobile_dir(cfg)),
+               ("ログ・重複DB", work_dir(cfg)))
+    for label, path in targets:
+        probe = os.path.join(path, f".write_test_{os.getpid()}.tmp")
+        try:
+            os.makedirs(path, exist_ok=True)
+            with open(probe, "w", encoding="utf-8") as f:
+                f.write("ok")
+            os.remove(probe)
+        except OSError as e:
+            problems.append((label, path, e))
+    return problems
+
+
 # ---------------------------------------------------------------- ログ出力
 _log_lock = threading.Lock()
 
@@ -1227,11 +1292,19 @@ def run_processing(cfg, q, cancel_event=None):
     def is_cancelled():
         return cancel_event is not None and cancel_event.is_set()
 
-    for d in (original_dir(cfg), mobile_dir(cfg), work_dir(cfg)):
-        try:
-            os.makedirs(d, exist_ok=True)
-        except Exception as e:
-            log("ERROR", f"フォルダを作成できません: {d} ({e})")
+    # 保存先に書き込めるかを先に確認する(600 件全部失敗するのを防ぐ)
+    problems = check_writable_dirs(cfg)
+    if problems:
+        for label, path, err in problems:
+            log("ERROR", f"{label} に書き込めません: {path} ({err})")
+        msg = ("保存先に書き込めないため処理を中止しました。\n"
+               "・書き込みできるフォルダ（例 C:\\PhotoBackup）を指定してください\n"
+               "・デスクトップや OneDrive の同期フォルダは、セキュリティソフトに"
+               "よって書き込みを止められることがあります\n"
+               "・保存先のアクセス権をご確認ください")
+        log("ERROR", msg.replace("\n", " / "))
+        q.put(("done", None, msg, False))
+        return
 
     intake = cfg["intake_dir"]
     if not os.path.isdir(intake):
@@ -1245,9 +1318,15 @@ def run_processing(cfg, q, cancel_event=None):
 
     # FFmpeg の事前確認(動画を処理する場合のみ)
     video_files = [p for p in files if os.path.splitext(p)[1].lower() in VIDEO_EXTS]
-    if video_files and not check_ffmpeg(cfg["ffmpeg_path"]):
-        log("ERROR", "FFmpeg が見つかりません。PATH に追加するか config.json の ffmpeg_path を設定してください。")
-        files = [p for p in files if os.path.splitext(p)[1].lower() not in VIDEO_EXTS]
+    if video_files:
+        found = find_ffmpeg(cfg)
+        if not found:
+            log("ERROR", "FFmpeg が見つかりません。設定画面の「FFmpeg」で場所を指定するか、"
+                         "PATH に追加してください。")
+            files = [p for p in files if os.path.splitext(p)[1].lower() not in VIDEO_EXTS]
+        else:
+            cfg = dict(cfg, ffmpeg_path=found)
+            log("INFO", f"FFmpeg: {found}")
 
     if not files:
         msg = "処理対象のファイルがありません。"
@@ -1587,6 +1666,19 @@ class App(tk.Tk):
                        "（動画 CRF は 18〜32 が目安）。").grid(
             row=3, column=0, columnspan=4, sticky="w", padx=6, pady=(0, 4))
 
+        # FFmpeg の場所
+        f_ff = ttk.Frame(f_comp)
+        f_ff.grid(row=4, column=0, columnspan=4, sticky="ew", padx=6, pady=(0, 6))
+        f_ff.columnconfigure(1, weight=1)
+        ttk.Label(f_ff, text="FFmpeg:").grid(row=0, column=0, sticky="w")
+        self.ffmpeg_var = tk.StringVar(value="ffmpeg")
+        ttk.Entry(f_ff, textvariable=self.ffmpeg_var).grid(
+            row=0, column=1, sticky="ew", padx=6)
+        ttk.Button(f_ff, text="参照...", width=8,
+                   command=self._browse_exe).grid(row=0, column=2)
+        ttk.Button(f_ff, text="自動検出", width=10,
+                   command=self._detect_ffmpeg).grid(row=0, column=3, padx=(6, 0))
+
         # 実行
         f_run = ttk.Frame(self)
         f_run.grid(row=4, column=0, sticky="ew", **pad)
@@ -1622,6 +1714,29 @@ class App(tk.Tk):
         d = filedialog.askdirectory(initialdir=initial, title=title)
         if d:
             var.set(os.path.normpath(d))
+
+    def _browse_exe(self):
+        current = self.ffmpeg_var.get()
+        initial = os.path.dirname(current) if os.path.isabs(current) else ""
+        path = filedialog.askopenfilename(
+            title="ffmpeg.exe を選択",
+            initialdir=initial or None,
+            filetypes=[("ffmpeg", "ffmpeg.exe"), ("実行ファイル", "*.exe"), ("すべて", "*.*")])
+        if path:
+            self.ffmpeg_var.set(os.path.normpath(path))
+
+    def _detect_ffmpeg(self):
+        cfg = dict(self.cfg, ffmpeg_path=self.ffmpeg_var.get().strip())
+        found = find_ffmpeg(cfg)
+        if found:
+            self.ffmpeg_var.set(found)
+            self._append_log(f"FFmpeg を検出しました: {found}")
+        else:
+            messagebox.showwarning(
+                "見つかりません",
+                "FFmpeg を自動検出できませんでした。\n"
+                "「参照...」から ffmpeg.exe を指定してください。\n"
+                "（例: C:\\ffmpeg\\bin\\ffmpeg.exe）")
 
     # --- 事前確認 ---
     def _preview(self):
@@ -1839,6 +1954,7 @@ class App(tk.Tk):
             self.cfg.get("video_codec", "hevc"), VIDEO_CODECS["hevc"]))
         self.heic_var.set(self.cfg.get("mobile_format", "jpg") == "heic")
         self.workers_var.set(str(self.cfg.get("workers", 1)))
+        self.ffmpeg_var.set(self.cfg.get("ffmpeg_path", "ffmpeg"))
 
         current = (self.cfg["image_long_side"], self.cfg["jpeg_quality"],
                    self.cfg["video_crf"])
@@ -1880,6 +1996,8 @@ class App(tk.Tk):
         self.cfg["mobile_format"] = "heic" if self.heic_var.get() else "jpg"
         self.cfg["workers"] = self._int_or(
             self.workers_var.get(), DEFAULT_CONFIG["workers"], 1, 16)
+        self.cfg["ffmpeg_path"] = normalize_dir(
+            self.ffmpeg_var.get(), DEFAULT_CONFIG["ffmpeg_path"])
 
     # --- 実行 ---
     def _validate_paths(self):
