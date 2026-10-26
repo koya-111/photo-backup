@@ -383,6 +383,71 @@ def test_profile_store(tmp):
     print("  profile store: OK")
 
 
+def test_video_dedup(tmp):
+    """動画も重複判定の対象になっているか（ffmpeg 無しで検証）。"""
+    intake = os.path.join(tmp, "vid_intake")
+    os.makedirs(intake, exist_ok=True)
+    with open(os.path.join(intake, "VID_20260701_010434.mp4"), "wb") as f:
+        f.write(b"\x00" * 1024)
+
+    cfg = dict(pb.DEFAULT_CONFIG, intake_dir=intake,
+               original_dir=os.path.join(tmp, "vid_orig"),
+               mobile_dir=os.path.join(tmp, "vid_mob"),
+               work_dir=os.path.join(tmp, "vid_work"),
+               compress_video=True, enable_dedup=True, dedup_mode="name")
+
+    calls = []
+
+    def fake_process_video(src, cfg, stats, cancel_event=None, progress_cb=None):
+        calls.append(src)
+        os.makedirs(cfg["mobile_dir"], exist_ok=True)
+        os.makedirs(cfg["original_dir"], exist_ok=True)
+        for base in (cfg["mobile_dir"], cfg["original_dir"]):
+            with open(os.path.join(base, os.path.basename(src)), "wb") as f:
+                f.write(b"x")
+        stats["videos"] += 1
+        return "ok"
+
+    old_proc, old_find = pb.process_video, pb.find_ffmpeg
+    pb.process_video = fake_process_video
+    pb.find_ffmpeg = lambda c: "ffmpeg"
+    try:
+        q = queue.Queue()
+        pb.run_processing(dict(cfg), q)
+        msgs = []
+        while not q.empty():
+            msgs.append(q.get())
+        assert "動画 1 件" in [m for m in msgs if m[0] == "done"][0][2], "1回目が処理されない"
+        assert len(calls) == 1, calls
+
+        # 2 回目は同名なのでスキップされ、動画が増えない
+        q = queue.Queue()
+        pb.run_processing(dict(cfg), q)
+        msgs = []
+        while not q.empty():
+            msgs.append(q.get())
+        summary = [m for m in msgs if m[0] == "done"][0][2]
+        assert "動画 0 件" in summary, f"動画が再度作られた: {summary}"
+        assert "重複スキップ 1 件" in summary, summary
+        assert len(calls) == 1, "重複なのに動画処理が呼ばれた"
+
+        # 台帳方式でもスキップされる
+        cfg2 = dict(cfg, mobile_dir=os.path.join(tmp, "vid_mob2"),
+                    original_dir=os.path.join(tmp, "vid_orig2"),
+                    work_dir=os.path.join(tmp, "vid_work2"),
+                    dedup_mode="ledger")
+        pb.run_processing(dict(cfg2), queue.Queue())
+        q = queue.Queue()
+        pb.run_processing(dict(cfg2), q)
+        msgs = []
+        while not q.empty():
+            msgs.append(q.get())
+        assert "動画 0 件" in [m for m in msgs if m[0] == "done"][0][2], "台帳でスキップされない"
+    finally:
+        pb.process_video, pb.find_ffmpeg = old_proc, old_find
+    print("  video dedup: OK")
+
+
 def test_cancel(tmp):
     """中止要求を出すと、残りのファイルを処理せずに止まる。"""
     import threading
@@ -602,6 +667,7 @@ def main():
         test_timezone(tmp)
         test_diagnostics(tmp)
         test_profile_store(tmp)
+        test_video_dedup(tmp)
         test_cancel(tmp)
         test_dedup_switch(tmp)
         test_name_dedup(tmp)

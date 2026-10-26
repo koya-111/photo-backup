@@ -704,13 +704,29 @@ class DuplicateChecker:
             return "name"
         if self.use_ledger and self.ledger.has(src):
             return "ledger"
-        if self.use_phash and self.store.is_duplicate(ph, self.threshold):
+        if self.use_phash and ph is not None and self.store.is_duplicate(ph, self.threshold):
             return "phash"
+        return None
+
+    def check_video(self, src):
+        """動画の重複判定。pHash は使えないため名前と台帳だけで判定する。"""
+        if not self.enabled:
+            return None
+        if self.use_name and self._stem(src) in self.names:
+            return "name"
+        if self.use_ledger and self.ledger.has(src):
+            return "ledger"
         return None
 
     def accept(self, ph, src):
         """処理したファイルを記録する(重複判定がオフでも履歴は残す)。"""
         self.store.add(ph)
+        self.ledger.add(src)
+        if self.use_name:
+            self.names.add(self._stem(src))
+
+    def accept_video(self, src):
+        """処理した動画を記録する(pHash は記録しない)。"""
         self.ledger.add(src)
         if self.use_name:
             self.names.add(self._stem(src))
@@ -1597,6 +1613,18 @@ def run_processing(cfg, q, cancel_event=None):
         name = os.path.basename(p)
         progress_done += 1
         try:
+            # 動画も重複判定を行う(pHash は使えないため名前・台帳のみ)
+            reason = checker.check_video(p)
+            if reason:
+                skipped_dup += 1
+                if reason == "name":
+                    skipped_name += 1
+                label = {"name": "同名ファイルあり",
+                         "ledger": "処理済み"}.get(reason, "重複")
+                handle_duplicate(p, cfg, label, log)
+                q.put(("progress", progress_done, total))
+                continue
+
             last = {"pct": 0.0}
 
             def report(pct, _name=name, _last=last):
@@ -1605,6 +1633,7 @@ def run_processing(cfg, q, cancel_event=None):
                     q.put(("video_progress", pct, _name))
 
             process_video(p, cfg, stats, cancel_event, report)
+            checker.accept_video(p)
             log("INFO", f"動画圧縮: {name}")
             if cfg["delete_after_process"]:
                 try:
@@ -1939,6 +1968,7 @@ class App(tk.Tk):
         if self.running:
             return
         self._save_ui_to_cfg()
+        save_config(self.cfg)
         if not os.path.isdir(self.cfg["intake_dir"]):
             messagebox.showerror(
                 "設定を確認してください",
@@ -1980,6 +2010,7 @@ class App(tk.Tk):
     # --- 診断 ---
     def _diagnose(self):
         self._save_ui_to_cfg()
+        save_config(self.cfg)
         try:
             info = diagnose_environment(self.cfg)
         except Exception as e:
@@ -2046,6 +2077,8 @@ class App(tk.Tk):
         self.original_var.set(os.path.join(base, "Original"))
         self.mobile_var.set(os.path.join(base, "Mobile"))
         self.work_var.set(base)
+        self._save_ui_to_cfg()
+        save_config(self.cfg)
         self._append_log(f"保存先を {base} に設定しました。")
 
     def _refresh_profiles(self):
