@@ -1311,8 +1311,13 @@ def diagnose_environment(cfg):
 
 
 def restricted_environment_hint(info):
-    """制限された環境から起動している疑いがあるときのヒントを返す。"""
+    """制限された環境から起動している疑いがあるときのヒントを返す。
+
+    書き込みテストがすべて成功している場合は、原因の推測は出さない。
+    """
     ok_map = {label: ok for label, _p, ok, _e in info["results"]}
+    if all(ok for _label, _path, ok, _err in info["results"]):
+        return None
     tokens = " ".join(info.get("token", []))
     if ("Low Mandatory" in tokens or "S-1-16-4096" in tokens
             or "低 Mandatory" in tokens):
