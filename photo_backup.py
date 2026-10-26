@@ -1205,6 +1205,15 @@ def check_writable_dirs(cfg):
     return problems
 
 
+def is_running_as_admin():
+    """管理者権限で動いているか。"""
+    try:
+        import ctypes
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except Exception:
+        return False
+
+
 def diagnose_environment(cfg):
     """書き込み不可の原因を切り分けるための情報を集める。"""
     import tempfile
@@ -1230,6 +1239,7 @@ def diagnose_environment(cfg):
         "exe": sys.executable,
         "cwd": os.getcwd(),
         "frozen": bool(getattr(sys, "frozen", False)),
+        "is_admin": is_running_as_admin(),
         "results": results,
         "dsh_vars": dsh_vars,
         "temp_env": os.environ.get("TEMP", ""),
@@ -1245,11 +1255,19 @@ def restricted_environment_hint(info):
                 "セッションのフォルダ以外への書き込みが制限されます。"
                 "アプリを閉じて、エクスプローラーから PhotoBackup.exe を"
                 "直接ダブルクリックして起動してください。")
+    if not any(ok_map.get(k) for k in ("Original", "Mobile", "ログ・重複DB")):
+        if not info.get("is_admin"):
+            return ("保存先に書き込めません。管理者として作成したフォルダは、"
+                    "通常のユーザーでは書き込めないことがあります。"
+                    "エクスプローラーでフォルダを作り直すか、次のコマンドを"
+                    "管理者として実行して権限を戻してください:\n"
+                    "icacls \"<保存先>\" /setintegritylevel (OI)(CI)Medium /T")
+        return ("保存先に書き込めません。フォルダのアクセス権や、"
+                "セキュリティソフトの保護を確認してください。")
     if ok_map.get("TEMP") and ok_map.get("exe のフォルダ"):
-        if not any(ok_map.get(k) for k in ("Original", "Mobile", "ログ・重複DB")):
-            return ("TEMP には書き込めるのに保存先には書き込めません。"
-                    "サンドボックスや仮想環境など制限された場所から起動している"
-                    "可能性があります。エクスプローラーから直接起動してください。")
+        return ("TEMP には書き込めるのに保存先には書き込めません。"
+                "サンドボックスや仮想環境など制限された場所から起動している"
+                "可能性があります。エクスプローラーから直接起動してください。")
     return None
 
 
@@ -1260,6 +1278,7 @@ def format_diagnostics(info):
         f"作業フォルダ: {info['cwd']}",
         f"exe 版: {'はい' if info['frozen'] else 'いいえ（ソースから実行）'}",
         f"起動元: {'エージェント（DSH）経由' if info['dsh_vars'] else '通常（エクスプローラー等）'}",
+        f"管理者として実行: {'はい' if info.get('is_admin') else 'いいえ'}",
         f"TEMP 設定: {info['temp_env'] or '（未設定）'}",
         f"TEMP 使用先: {info['temp_used']}",
         "",
@@ -1936,18 +1955,22 @@ class App(tk.Tk):
         self._append_log(f"プロファイル「{name}」を読み込みました。")
 
     def _save_profile(self):
-        default = self.profile_combo.get() or "新しいプロファイル"
+        default = self.profile_combo.get() or datetime.now().strftime("設定-%Y%m%d-%H%M")
         name = simpledialog.askstring("プロファイルの保存", "名前を入力してください:",
                                       initialvalue=default, parent=self)
         if not name:
             return
+        name = name.strip()
+        if name in self.profiles and not messagebox.askyesno(
+                "確認", f"プロファイル「{name}」を上書きしますか？"):
+            return
         self._save_ui_to_cfg()
-        self.profiles[name.strip()] = {
+        self.profiles[name] = {
             k: self.cfg[k] for k in DEFAULT_CONFIG if k in self.cfg}
         if save_profiles(self.profiles):
             self._refresh_profiles()
-            self.profile_combo.set(name.strip())
-            self._append_log(f"プロファイル「{name.strip()}」を保存しました。")
+            self.profile_combo.set(name)
+            self._append_log(f"プロファイル「{name}」を保存しました。")
         else:
             messagebox.showerror("エラー", "プロファイルを保存できませんでした。")
 
