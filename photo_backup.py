@@ -1221,29 +1221,35 @@ def diagnose_environment(cfg):
     for label, path in targets:
         if not path:
             continue
-        if os.path.isdir(path) and label == "取り込みフォルダ":
-            ok, err = is_writable_dir(path)
-        else:
-            ok, err = is_writable_dir(path)
+        ok, err = is_writable_dir(path)
         results.append((label, path, ok, err))
+
+    dsh_vars = sorted(k for k in os.environ if k.startswith("DSH_"))
     return {
         "user": os.environ.get("USERNAME", ""),
         "exe": sys.executable,
         "cwd": os.getcwd(),
         "frozen": bool(getattr(sys, "frozen", False)),
         "results": results,
+        "dsh_vars": dsh_vars,
+        "temp_env": os.environ.get("TEMP", ""),
+        "temp_used": tempfile.gettempdir(),
     }
 
 
 def restricted_environment_hint(info):
-    """TEMP には書けるのに保存先に書けない場合のヒントを返す。"""
+    """制限された環境から起動している疑いがあるときのヒントを返す。"""
     ok_map = {label: ok for label, _p, ok, _e in info["results"]}
+    if info.get("dsh_vars"):
+        return ("エージェント（DSH）経由で起動されています。この場合、"
+                "セッションのフォルダ以外への書き込みが制限されます。"
+                "アプリを閉じて、エクスプローラーから PhotoBackup.exe を"
+                "直接ダブルクリックして起動してください。")
     if ok_map.get("TEMP") and ok_map.get("exe のフォルダ"):
         if not any(ok_map.get(k) for k in ("Original", "Mobile", "ログ・重複DB")):
             return ("TEMP には書き込めるのに保存先には書き込めません。"
-                    "エージェントやサンドボックス、仮想環境など制限された場所から"
-                    "起動している可能性があります。エクスプローラーから直接 "
-                    "PhotoBackup.exe をダブルクリックして起動してください。")
+                    "サンドボックスや仮想環境など制限された場所から起動している"
+                    "可能性があります。エクスプローラーから直接起動してください。")
     return None
 
 
@@ -1253,6 +1259,9 @@ def format_diagnostics(info):
         f"実行ファイル: {info['exe']}",
         f"作業フォルダ: {info['cwd']}",
         f"exe 版: {'はい' if info['frozen'] else 'いいえ（ソースから実行）'}",
+        f"起動元: {'エージェント（DSH）経由' if info['dsh_vars'] else '通常（エクスプローラー等）'}",
+        f"TEMP 設定: {info['temp_env'] or '（未設定）'}",
+        f"TEMP 使用先: {info['temp_used']}",
         "",
         "書き込みテスト:",
     ]
