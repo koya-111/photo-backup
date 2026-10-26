@@ -1179,6 +1179,19 @@ def find_ffmpeg(cfg):
 
 
 # ---------------------------------------------------------------- 保存先の書き込み確認
+def is_writable_dir(path):
+    """実際にファイルを作って書き込み可否を確かめる。(可否, エラー文字列)"""
+    probe = os.path.join(path, f".write_test_{os.getpid()}_{int(time.time() * 1000)}.tmp")
+    try:
+        os.makedirs(path, exist_ok=True)
+        with open(probe, "w", encoding="utf-8") as f:
+            f.write("ok")
+        os.remove(probe)
+        return True, None
+    except OSError as e:
+        return False, str(e)
+
+
 def check_writable_dirs(cfg):
     """保存先に書き込めるかを実際に試す。問題があれば [(名前, パス, 例外)] を返す。"""
     problems = []
@@ -1186,15 +1199,73 @@ def check_writable_dirs(cfg):
                ("Mobile", mobile_dir(cfg)),
                ("ログ・重複DB", work_dir(cfg)))
     for label, path in targets:
-        probe = os.path.join(path, f".write_test_{os.getpid()}.tmp")
-        try:
-            os.makedirs(path, exist_ok=True)
-            with open(probe, "w", encoding="utf-8") as f:
-                f.write("ok")
-            os.remove(probe)
-        except OSError as e:
-            problems.append((label, path, e))
+        ok, err = is_writable_dir(path)
+        if not ok:
+            problems.append((label, path, err))
     return problems
+
+
+def diagnose_environment(cfg):
+    """書き込み不可の原因を切り分けるための情報を集める。"""
+    import tempfile
+
+    targets = [
+        ("exe のフォルダ", SCRIPT_DIR),
+        ("TEMP", tempfile.gettempdir()),
+        ("Original", original_dir(cfg)),
+        ("Mobile", mobile_dir(cfg)),
+        ("ログ・重複DB", work_dir(cfg)),
+        ("取り込みフォルダ", cfg.get("intake_dir", "")),
+    ]
+    results = []
+    for label, path in targets:
+        if not path:
+            continue
+        if os.path.isdir(path) and label == "取り込みフォルダ":
+            ok, err = is_writable_dir(path)
+        else:
+            ok, err = is_writable_dir(path)
+        results.append((label, path, ok, err))
+    return {
+        "user": os.environ.get("USERNAME", ""),
+        "exe": sys.executable,
+        "cwd": os.getcwd(),
+        "frozen": bool(getattr(sys, "frozen", False)),
+        "results": results,
+    }
+
+
+def restricted_environment_hint(info):
+    """TEMP には書けるのに保存先に書けない場合のヒントを返す。"""
+    ok_map = {label: ok for label, _p, ok, _e in info["results"]}
+    if ok_map.get("TEMP") and ok_map.get("exe のフォルダ"):
+        if not any(ok_map.get(k) for k in ("Original", "Mobile", "ログ・重複DB")):
+            return ("TEMP には書き込めるのに保存先には書き込めません。"
+                    "エージェントやサンドボックス、仮想環境など制限された場所から"
+                    "起動している可能性があります。エクスプローラーから直接 "
+                    "PhotoBackup.exe をダブルクリックして起動してください。")
+    return None
+
+
+def format_diagnostics(info):
+    lines = [
+        f"ユーザー: {info['user']}",
+        f"実行ファイル: {info['exe']}",
+        f"作業フォルダ: {info['cwd']}",
+        f"exe 版: {'はい' if info['frozen'] else 'いいえ（ソースから実行）'}",
+        "",
+        "書き込みテスト:",
+    ]
+    for label, path, ok, err in info["results"]:
+        mark = "OK" if ok else "NG"
+        line = f"  [{mark}] {label}: {path}"
+        if err:
+            line += f"  ({err})"
+        lines.append(line)
+    hint = restricted_environment_hint(info)
+    if hint:
+        lines += ["", "推定原因:", hint]
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------- ログ出力
@@ -1297,11 +1368,16 @@ def run_processing(cfg, q, cancel_event=None):
     if problems:
         for label, path, err in problems:
             log("ERROR", f"{label} に書き込めません: {path} ({err})")
-        msg = ("保存先に書き込めないため処理を中止しました。\n"
-               "・書き込みできるフォルダ（例 C:\\PhotoBackup）を指定してください\n"
-               "・デスクトップや OneDrive の同期フォルダは、セキュリティソフトに"
-               "よって書き込みを止められることがあります\n"
-               "・保存先のアクセス権をご確認ください")
+        info = diagnose_environment(cfg)
+        hint = restricted_environment_hint(info)
+        if hint:
+            msg = "保存先に書き込めないため処理を中止しました。\n" + hint
+        else:
+            msg = ("保存先に書き込めないため処理を中止しました。\n"
+                   "・書き込みできるフォルダ（例 C:\\PhotoBackup）を指定してください\n"
+                   "・デスクトップや OneDrive の同期フォルダは、セキュリティソフトに"
+                   "よって書き込みを止められることがあります\n"
+                   "・保存先のアクセス権をご確認ください")
         log("ERROR", msg.replace("\n", " / "))
         q.put(("done", None, msg, False))
         return
@@ -1685,6 +1761,9 @@ class App(tk.Tk):
         self.preview_btn = ttk.Button(f_run, text="事前確認", width=10,
                                       command=self._preview)
         self.preview_btn.pack(side="left")
+        self.diagnose_btn = ttk.Button(f_run, text="診断", width=8,
+                                       command=self._diagnose)
+        self.diagnose_btn.pack(side="left", padx=(6, 0))
         self.run_btn = ttk.Button(f_run, text="実行", width=8, command=self._start)
         self.run_btn.pack(side="left", padx=(6, 0))
         self.cancel_btn = ttk.Button(f_run, text="中止", width=8,
@@ -1780,6 +1859,18 @@ class App(tk.Tk):
         self._append_log("事前確認: " + " / ".join(
             x for x in lines[:2] if x))
         messagebox.showinfo("事前確認（書き込みは行いません）", "\n".join(lines))
+
+    # --- 診断 ---
+    def _diagnose(self):
+        self._save_ui_to_cfg()
+        try:
+            info = diagnose_environment(self.cfg)
+        except Exception as e:
+            messagebox.showerror("診断に失敗しました", str(e))
+            return
+        text = format_diagnostics(info)
+        self._append_log("診断: " + text.replace("\n", " / "))
+        messagebox.showinfo("環境診断（書き込みテスト）", text)
 
     # --- フォルダ監視 ---
     def _toggle_watch(self):
