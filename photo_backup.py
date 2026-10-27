@@ -116,7 +116,7 @@ def dependency_message():
     return "\n".join(lines).rstrip() if lines else None
 
 APP_NAME = "PhotoBackup"
-APP_VERSION = "1.0.1"
+APP_VERSION = "1.0.2"
 APP_TITLE = "Android 写真 バックアップ＆軽量化ツール"
 
 # ---------------------------------------------------------------- 設定の既定値
@@ -298,6 +298,20 @@ def copy_verified(src, dest):
     finally:
         if os.path.exists(tmp):
             _remove_quietly(tmp)
+
+
+def apply_media_timestamp(path, dt):
+    """出力ファイルの更新日時を撮影日時に合わせる。
+
+    スマホのギャラリーは、メタデータに日時が無い場合にファイルの更新日時で
+    並べることがある。PC 側で書き出した直後は「今」の日時になるため、
+    撮影日時に揃えておく(コピー方法によっては引き継がれないが、害はない)。
+    """
+    try:
+        ts = dt.timestamp()
+        os.utime(path, (ts, ts))
+    except (OSError, OverflowError, ValueError):
+        pass
 
 
 def delete_file(path, use_recycle_bin=True):
@@ -870,6 +884,9 @@ def write_prepared(prep, cfg, checker, stats):
     with open(dest_mobile, "wb") as f:
         f.write(prep["data"])
 
+    # 3) 更新日時も撮影日時に合わせる(日時メタデータが無い画像の並び対策)
+    apply_media_timestamp(dest_mobile, dt)
+
     checker.accept(prep["phash"], src)
 
     stats["images"] += 1
@@ -1006,6 +1023,16 @@ def get_video_datetime(src, ffmpeg_path=None):
     return datetime.fromtimestamp(os.path.getmtime(src))
 
 
+def to_mp4_creation_time(dt):
+    """ローカル時刻の datetime を MP4 の creation_time(UTC)表記に直す。
+
+    スマホのギャラリー(Google フォト / Google Gallery など)は、動画の
+    並び順に MP4 の作成日時(creation_time。ExifTool の Create Date)を使う。
+    引き継がずに再エンコードすると現在時刻になり、先頭へ移動してしまう。
+    """
+    return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
 class Cancelled(Exception):
     """ユーザーが中止を要求したときに送出する。"""
 
@@ -1089,10 +1116,16 @@ def process_video(src, cfg, stats, cancel_event=None, progress_cb=None):
         video_args = ["-c:v", "libx265", "-crf", str(cfg["video_crf"]),
                       "-preset", cfg["video_preset"], "-tag:v", "hvc1"]
 
+    # MP4 の作成日時(creation_time)はギャラリーの並び順に使われる。
+    # 元動画のメタデータを引き継ぎ、撮影日時を明示的に書き込む
+    # (書き込まないと 0000:00:00 になり、ギャラリーの先頭へ移動する)。
+    creation_time = to_mp4_creation_time(dt)
     cmd = ([cfg["ffmpeg_path"], "-y", "-i", src,
             "-map", "0:v:0", "-map", "0:a?"]
            + video_args + audio_args
-           + ["-movflags", "+faststart",
+           + ["-map_metadata", "0",
+              "-metadata", f"creation_time={creation_time}",
+              "-movflags", "+faststart",
               "-progress", "pipe:1", "-nostats", "-loglevel", "error",
               dest_mobile])
     # 中止要求にすぐ反応できるよう、完了を待たずに一定間隔で状態を見る
@@ -1150,6 +1183,9 @@ def process_video(src, cfg, stats, cancel_event=None, progress_cb=None):
     stats["videos"] += 1
     stats["orig_bytes"] += os.path.getsize(src)
     stats["new_bytes"] += os.path.getsize(dest_mobile)
+
+    # ファイルの更新日時も撮影日時に合わせる(ギャラリーの並びの保険)
+    apply_media_timestamp(dest_mobile, dt)
     return "ok"
 
 

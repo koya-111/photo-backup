@@ -10,6 +10,7 @@ import os
 import queue
 import random
 import shutil
+import subprocess
 import sys
 import tempfile
 from datetime import datetime
@@ -303,6 +304,101 @@ def test_quality(tmp):
     info = pb.probe_streams(os.path.join(tmp, "no_such.mp4"), "ffmpeg")
     assert info["duration"] is None and info["audio"] is None, info
     print("  quality: OK")
+
+
+def test_media_timestamp(tmp):
+    """出力ファイルの日時を撮影日時に合わせる処理（ffmpeg 不要）。"""
+    dt = datetime(2020, 1, 2, 3, 4, 5)
+    path = os.path.join(tmp, "timestamp_probe.txt")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("x")
+    pb.apply_media_timestamp(path, dt)
+    assert abs(os.path.getmtime(path) - dt.timestamp()) < 2, "更新日時が変わっていない"
+
+    # MP4 の creation_time は UTC 表記で書き込む
+    assert pb.to_mp4_creation_time(dt) == \
+        dt.astimezone(pb.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    print("  media timestamp: OK")
+
+
+def find_test_ffmpeg():
+    """テストで使える ffmpeg を探す（無ければ None）。"""
+    for candidate in pb.ffmpeg_candidates(dict(pb.DEFAULT_CONFIG, ffmpeg_path="ffmpeg")):
+        if pb.check_ffmpeg(candidate):
+            return candidate
+    return None
+
+
+def make_video(path, ffmpeg, creation_time="2021-05-04T03:34:56Z"):
+    """撮影日時入りの短いテスト動画を作る。"""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    cmd = [
+        ffmpeg, "-y", "-loglevel", "error",
+        "-f", "lavfi", "-i", "testsrc=size=160x120:rate=15:duration=1",
+        "-f", "lavfi", "-i", "sine=frequency=440:duration=1",
+        "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac",
+        "-metadata", f"creation_time={creation_time}",
+        "-movflags", "+faststart", path,
+    ]
+    subprocess.run(cmd, check=True, capture_output=True)
+
+
+def test_video_dates(tmp):
+    """動画の作成日時(creation_time)と更新日時が失われないこと。"""
+    ffmpeg = find_test_ffmpeg()
+    if not ffmpeg:
+        print("  video dates: SKIP（ffmpeg が見つかりません）")
+        return
+
+    src = os.path.join(tmp, "vd_intake", "PXL_20210504_033456.mp4")
+    try:
+        make_video(src, ffmpeg)
+    except Exception as e:  # noqa: BLE001  (libx264 が無いビルドなど)
+        print(f"  video dates: SKIP（テスト動画を作れません: {e}）")
+        return
+
+    # 1) 圧縮しても MP4 の作成日時とファイルの更新日時が残る
+    cfg = dict(pb.DEFAULT_CONFIG, intake_dir=os.path.dirname(src),
+               original_dir=os.path.join(tmp, "vd_orig"),
+               mobile_dir=os.path.join(tmp, "vd_mob"),
+               work_dir=os.path.join(tmp, "vd_work"),
+               layout="YYYY\\MM", compress_video=True, ffmpeg_path=ffmpeg)
+    stats = {"images": 0, "videos": 0, "orig_bytes": 0, "new_bytes": 0}
+    assert pb.process_video(src, cfg, stats) == "ok"
+
+    outs = [os.path.join(r, n) for r, _, ns in os.walk(cfg["mobile_dir"]) for n in ns]
+    assert len(outs) == 1, outs
+    out = outs[0]
+    expected = pb.probe_video_datetime(src, ffmpeg)
+    assert expected is not None, "テスト動画に creation_time が無い"
+    assert pb.probe_video_datetime(out, ffmpeg) == expected, \
+        "圧縮後に creation_time が失われている"
+    assert abs(os.path.getmtime(out) - expected.timestamp()) < 2, \
+        "出力の更新日時が撮影日時になっていない"
+    assert os.path.join("2021", "05") in out, f"撮影日時のフォルダに置かれていない: {out}"
+
+    # 2) v1.0.1 以前の出力(creation_time なし)を修復できる
+    import repair_video_dates as rvd
+
+    repair_root = os.path.join(tmp, "vd_repair")
+    mobile_dir = os.path.join(repair_root, "Mobile", "2021", "05")
+    original_dir = os.path.join(repair_root, "Original", "2021", "05")
+    os.makedirs(mobile_dir, exist_ok=True)
+    os.makedirs(original_dir, exist_ok=True)
+    name = os.path.basename(src)
+    shutil.copy2(src, os.path.join(original_dir, name))
+    broken = os.path.join(mobile_dir, name)
+    subprocess.run([ffmpeg, "-y", "-loglevel", "error", "-i", src,
+                    "-map", "0", "-c", "copy", "-map_metadata", "-1",
+                    "-movflags", "+faststart", broken],
+                   check=True, capture_output=True)
+    assert pb.probe_video_datetime(broken, ffmpeg) is None, "壊れた動画の前提が違う"
+
+    assert rvd.main([os.path.join(repair_root, "Mobile"), "--ffmpeg", ffmpeg]) == 0
+    assert pb.probe_video_datetime(broken, ffmpeg) == expected, "修復されていない"
+    assert abs(os.path.getmtime(broken) - expected.timestamp()) < 2, \
+        "修復後に更新日時が撮影日時になっていない"
+    print("  video dates: OK")
 
 
 def test_timezone(tmp):
@@ -664,6 +760,8 @@ def main():
         test_safety(tmp)
         test_ops(tmp)
         test_quality(tmp)
+        test_media_timestamp(tmp)
+        test_video_dates(tmp)
         test_timezone(tmp)
         test_diagnostics(tmp)
         test_profile_store(tmp)
