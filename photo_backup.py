@@ -116,7 +116,7 @@ def dependency_message():
     return "\n".join(lines).rstrip() if lines else None
 
 APP_NAME = "PhotoBackup"
-APP_VERSION = "1.0.2"
+APP_VERSION = "1.0.3"
 APP_TITLE = "Android 写真 バックアップ＆軽量化ツール"
 
 # ---------------------------------------------------------------- 設定の既定値
@@ -1037,6 +1037,21 @@ class Cancelled(Exception):
     """ユーザーが中止を要求したときに送出する。"""
 
 
+def wait_while_paused(pause_event, cancel_event=None, interval=0.2):
+    """一時停止中なら再開されるまで待つ。
+
+    中止が要求された場合は False を返す(呼び出し側で中断する)。
+    """
+    if pause_event is None or not pause_event.is_set():
+        return True
+    while pause_event.is_set():
+        if cancel_event is not None and cancel_event.is_set():
+            return False
+        time.sleep(interval)
+    # 待っている間に中止されていた場合も、続行せず中断する
+    return cancel_event is None or not cancel_event.is_set()
+
+
 # ---------------------------------------------------------------- 動画の追加情報
 VIDEO_CODECS = {
     "hevc": "H.265（HEVC・高圧縮）",
@@ -1079,8 +1094,61 @@ def _parse_out_time(value):
         return None
 
 
+def _control_process(proc, resume=False):
+    """Windows で他プロセスを一時停止/再開する(内部用)。
+
+    subprocess.Popen が持つプロセスハンドルをそのまま使う。ハンドルが
+    無い場合(pid 指定)は OpenProcess で開く。NtSuspendProcess 系は
+    非公開 API のため、失敗した場合は False を返す。
+    """
+    if os.name != "nt":
+        return False
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        ntdll = ctypes.WinDLL("ntdll")
+        func = ntdll.NtResumeProcess if resume else ntdll.NtSuspendProcess
+        func.argtypes = [wintypes.HANDLE]
+        func.restype = ctypes.c_long
+
+        handle = getattr(proc, "_handle", None)
+        if handle is not None:
+            return func(int(handle)) == 0
+
+        PROCESS_SUSPEND_RESUME = 0x0800
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+
+        h = kernel32.OpenProcess(PROCESS_SUSPEND_RESUME, False, int(proc))
+        if not h:
+            return False
+        try:
+            return func(h) == 0
+        finally:
+            kernel32.CloseHandle(h)
+    except Exception:
+        return False
+
+
+def suspend_process(proc):
+    """実行中のプロセスを一時停止する(Windows のみ)。成功したら True。
+
+    Popen オブジェクトか PID を渡す。
+    """
+    return _control_process(proc, resume=False)
+
+
+def resume_process(proc):
+    """一時停止したプロセスを再開する(Windows のみ)。成功したら True。"""
+    return _control_process(proc, resume=True)
+
+
 # ---------------------------------------------------------------- 動画処理
-def process_video(src, cfg, stats, cancel_event=None, progress_cb=None):
+def process_video(src, cfg, stats, cancel_event=None, progress_cb=None,
+                  pause_event=None):
     dt = get_video_datetime(src, cfg.get("ffmpeg_path"))
 
     if cancel_event is not None and cancel_event.is_set():
@@ -1148,6 +1216,7 @@ def process_video(src, cfg, stats, cancel_event=None, progress_cb=None):
 
     reader = threading.Thread(target=read_stdout, daemon=True)
     reader.start()
+    suspended = False
     try:
         while True:
             try:
@@ -1156,7 +1225,16 @@ def process_video(src, cfg, stats, cancel_event=None, progress_cb=None):
             except subprocess.TimeoutExpired:
                 if cancel_event is not None and cancel_event.is_set():
                     proc.kill()
-                    raise Cancelled()
+                    # ここでは抜けるだけにして、終了コードの判定で後片付けする
+                    break
+                # 一時停止中は FFmpeg 自体を止める(対応環境のみ)。
+                # 止められない環境でも、ファイルの区切りで停止する。
+                want_pause = pause_event is not None and pause_event.is_set()
+                if want_pause and not suspended:
+                    suspended = suspend_process(proc)
+                elif not want_pause and suspended:
+                    resume_process(proc)
+                    suspended = False
     finally:
         if proc.poll() is None:
             proc.kill()
@@ -1517,7 +1595,7 @@ def remove_empty_subdirs(intake):
 
 
 # ---------------------------------------------------------------- 処理本体(別スレッドで実行)
-def run_processing(cfg, q, cancel_event=None):
+def run_processing(cfg, q, cancel_event=None, pause_event=None):
     log_file = log_path(cfg)
     cancelled = False
     rotate_log(cfg)
@@ -1527,6 +1605,18 @@ def run_processing(cfg, q, cancel_event=None):
 
     def is_cancelled():
         return cancel_event is not None and cancel_event.is_set()
+
+    def wait_pause():
+        """一時停止中なら再開されるまで待つ。中止されたら False を返す。"""
+        if pause_event is None or not pause_event.is_set():
+            return True
+        q.put(("paused", True))
+        log("INFO", "一時停止しました（「再開」を押すと続行します）")
+        resumed = wait_while_paused(pause_event, cancel_event)
+        q.put(("paused", False))
+        if resumed:
+            log("INFO", "再開しました")
+        return resumed
 
     # 保存先に書き込めるかを先に確認する(600 件全部失敗するのを防ぐ)
     problems = check_writable_dirs(cfg)
@@ -1608,6 +1698,10 @@ def run_processing(cfg, q, cancel_event=None):
 
     # --- 画像 ---
     for prep in iter_prepared(image_files, cfg, workers, cancel_event):
+        if not wait_pause():
+            cancelled = True
+            log("WARN", "中止要求を受け付けたため、残りのファイルを処理せず停止しました。")
+            break
         if is_cancelled():
             cancelled = True
             log("WARN", "中止要求を受け付けたため、残りのファイルを処理せず停止しました。")
@@ -1644,6 +1738,10 @@ def run_processing(cfg, q, cancel_event=None):
 
     # --- 動画 ---
     for p in movie_files:
+        if not wait_pause():
+            cancelled = True
+            log("WARN", "中止要求を受け付けたため、残りのファイルを処理せず停止しました。")
+            break
         if cancelled or is_cancelled():
             cancelled = True
             log("WARN", "中止要求を受け付けたため、残りのファイルを処理せず停止しました。")
@@ -1670,7 +1768,8 @@ def run_processing(cfg, q, cancel_event=None):
                     _last["pct"] = pct
                     q.put(("video_progress", pct, _name))
 
-            process_video(p, cfg, stats, cancel_event, report)
+            process_video(p, cfg, stats, cancel_event, report,
+                          pause_event=pause_event)
             checker.accept_video(p)
             log("INFO", f"動画圧縮: {name}")
             if cfg["delete_after_process"]:
@@ -1730,6 +1829,7 @@ class App(tk.Tk):
         self.queue = queue.Queue()
         self.running = False
         self.cancel_event = threading.Event()
+        self.pause_event = threading.Event()
         self.profiles, self._last_profile = load_profile_store()
         self._active_profile = ""
         self._watch_signature = None
@@ -1950,6 +2050,9 @@ class App(tk.Tk):
         self.diagnose_btn.pack(side="left", padx=(6, 0))
         self.run_btn = ttk.Button(f_run, text="実行", width=8, command=self._start)
         self.run_btn.pack(side="left", padx=(6, 0))
+        self.pause_btn = ttk.Button(f_run, text="一時停止", width=9,
+                                    command=self._toggle_pause, state="disabled")
+        self.pause_btn.pack(side="left", padx=(6, 0))
         self.cancel_btn = ttk.Button(f_run, text="中止", width=8,
                                      command=self._cancel, state="disabled")
         self.cancel_btn.pack(side="left", padx=(6, 0))
@@ -2380,7 +2483,9 @@ class App(tk.Tk):
 
         self.running = True
         self.cancel_event.clear()
+        self.pause_event.clear()
         self.run_btn.config(state="disabled")
+        self.pause_btn.config(text="一時停止", state="normal")
         self.cancel_btn.config(state="normal")
         self.progress["value"] = 0
         self.result_var.set("処理中...")
@@ -2389,9 +2494,23 @@ class App(tk.Tk):
         self.log_text.config(state="disabled")
 
         t = threading.Thread(target=run_processing,
-                             args=(self.cfg, self.queue, self.cancel_event),
+                             args=(self.cfg, self.queue, self.cancel_event,
+                                   self.pause_event),
                              daemon=True)
         t.start()
+
+    # --- 一時停止/再開 ---
+    def _toggle_pause(self):
+        if not self.running:
+            return
+        if self.pause_event.is_set():
+            self.pause_event.clear()
+            self.pause_btn.config(text="一時停止")
+            self.result_var.set("再開しています...")
+        else:
+            self.pause_event.set()
+            self.pause_btn.config(text="再開")
+            self.result_var.set("一時停止中...（「再開」で続行します）")
 
     # --- 中止 ---
     def _cancel(self):
@@ -2399,6 +2518,7 @@ class App(tk.Tk):
             return
         self.cancel_event.set()
         self.cancel_btn.config(state="disabled")
+        self.pause_btn.config(text="一時停止", state="disabled")
         self.result_var.set("中止しています...（実行中のファイルが終わり次第停止します）")
         self._append_log("中止を要求しました。")
 
@@ -2413,15 +2533,24 @@ class App(tk.Tk):
                     self.progress["value"] = 0
                 elif kind == "progress":
                     self.progress["value"] = msg[1]
-                    self.result_var.set(f"処理中... {msg[1]}/{msg[2]}")
+                    if not self.pause_event.is_set():
+                        self.result_var.set(f"処理中... {msg[1]}/{msg[2]}")
                 elif kind == "video_progress":
-                    self.result_var.set(
-                        f"動画を圧縮中... {msg[1]:.0f}%（{msg[2]}）")
+                    if not self.pause_event.is_set():
+                        self.result_var.set(
+                            f"動画を圧縮中... {msg[1]:.0f}%（{msg[2]}）")
+                elif kind == "paused":
+                    if msg[1]:
+                        self.result_var.set("一時停止中...（「再開」で続行します）")
+                    else:
+                        self.result_var.set("処理中...")
                 elif kind == "log":
                     self._append_log(msg[1])
                 elif kind == "done":
                     self.result_var.set(msg[2])
                     self.running = False
+                    self.pause_event.clear()
+                    self.pause_btn.config(text="一時停止", state="disabled")
                     self.run_btn.config(state="normal")
                     self.cancel_btn.config(state="disabled")
                     self.cancel_event.clear()
@@ -2434,6 +2563,8 @@ class App(tk.Tk):
             if not messagebox.askyesno(
                     "確認", "処理中です。中止して終了してもよろしいですか？"):
                 return
+            # 一時停止中でも終了できるよう、停止を解除してから中止する
+            self.pause_event.clear()
             self.cancel_event.set()
             self.after(300, self.destroy)
             return

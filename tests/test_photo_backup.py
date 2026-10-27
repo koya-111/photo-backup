@@ -13,6 +13,8 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 from datetime import datetime
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -494,7 +496,8 @@ def test_video_dedup(tmp):
 
     calls = []
 
-    def fake_process_video(src, cfg, stats, cancel_event=None, progress_cb=None):
+    def fake_process_video(src, cfg, stats, cancel_event=None, progress_cb=None,
+                           pause_event=None):
         calls.append(src)
         os.makedirs(cfg["mobile_dir"], exist_ok=True)
         os.makedirs(cfg["original_dir"], exist_ok=True)
@@ -542,6 +545,85 @@ def test_video_dedup(tmp):
     finally:
         pb.process_video, pb.find_ffmpeg = old_proc, old_find
     print("  video dedup: OK")
+
+
+def wait_for_paused(q, timeout=10.0):
+    """queue から「一時停止した」通知が来るまで待つ。"""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            msg = q.get(timeout=0.2)
+        except queue.Empty:
+            continue
+        if msg[0] == "paused" and msg[1]:
+            return True
+    return False
+
+
+def test_pause(tmp):
+    """一時停止中は処理が進まず、再開すると続きから処理されること。"""
+    intake = os.path.join(tmp, "pause_intake")
+    for i in range(3):
+        make_image(os.path.join(intake, f"pz{i}.jpg"), 80 + i)
+    cfg = dict(pb.DEFAULT_CONFIG, intake_dir=intake,
+               original_dir=os.path.join(tmp, "pause_orig"),
+               mobile_dir=os.path.join(tmp, "pause_mob"),
+               work_dir=os.path.join(tmp, "pause_work"))
+
+    pause = threading.Event()
+    pause.set()
+    q = queue.Queue()
+    t = threading.Thread(target=pb.run_processing,
+                         args=(cfg, q, threading.Event(), pause), daemon=True)
+    t.start()
+    assert wait_for_paused(q), "一時停止の通知が無い"
+
+    mob = [f for _, _, fs in os.walk(cfg["mobile_dir"]) for f in fs]
+    assert mob == [], f"一時停止中なのに処理された: {mob}"
+
+    pause.clear()
+    t.join(60)
+    assert not t.is_alive(), "再開しても処理が終わらない"
+    mob = [f for _, _, fs in os.walk(cfg["mobile_dir"]) for f in fs]
+    assert len(mob) == 3, f"再開後に処理されていない: {mob}"
+
+    # 一時停止中に中止すると、処理せず終了する
+    intake2 = os.path.join(tmp, "pause_intake2")
+    for i in range(2):
+        make_image(os.path.join(intake2, f"pc{i}.jpg"), 90 + i)
+    cfg2 = dict(cfg, intake_dir=intake2,
+                original_dir=os.path.join(tmp, "pause_orig2"),
+                mobile_dir=os.path.join(tmp, "pause_mob2"),
+                work_dir=os.path.join(tmp, "pause_work2"))
+    pause2 = threading.Event()
+    pause2.set()
+    cancel2 = threading.Event()
+    q2 = queue.Queue()
+    t2 = threading.Thread(target=pb.run_processing,
+                          args=(cfg2, q2, cancel2, pause2), daemon=True)
+    t2.start()
+    assert wait_for_paused(q2), "2 回目の一時停止の通知が無い"
+    cancel2.set()
+    t2.join(30)
+    msgs = []
+    while not q2.empty():
+        msgs.append(q2.get())
+    done = [m for m in msgs if m[0] == "done"]
+    assert done and "中止しました" in done[0][2], done
+    mob2 = [f for _, _, fs in os.walk(cfg2["mobile_dir"]) for f in fs]
+    assert mob2 == [], f"中止したのに処理された: {mob2}"
+
+    # Windows では実行中プロセスを実際に止められる（失敗しても処理は継続する）
+    if os.name == "nt":
+        proc = subprocess.Popen([sys.executable, "-c",
+                                 "import time; time.sleep(30)"])
+        try:
+            if pb.suspend_process(proc):
+                assert pb.resume_process(proc), "一時停止したプロセスを再開できない"
+        finally:
+            proc.kill()
+            proc.wait()
+    print("  pause: OK")
 
 
 def test_cancel(tmp):
@@ -767,6 +849,7 @@ def main():
         test_profile_store(tmp)
         test_video_dedup(tmp)
         test_cancel(tmp)
+        test_pause(tmp)
         test_dedup_switch(tmp)
         test_name_dedup(tmp)
     finally:
